@@ -374,8 +374,23 @@ fn trim_trailing_blanks(lines: &[&str], start: usize, next_start: usize) -> usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::types::{FileChange, FileStatus};
     use crate::model::change::ChangeType;
-    use crate::model::identity::match_entities;
+    use crate::parser::differ::compute_semantic_diff;
+    use crate::parser::registry::ParserRegistry;
+
+    fn json_diff(before: &str, after: &str) -> Vec<crate::model::change::SemanticChange> {
+        let mut registry = ParserRegistry::new();
+        registry.register(Box::new(JsonParserPlugin));
+        let changes = vec![FileChange {
+            file_path: "test.json".to_string(),
+            status: FileStatus::Modified,
+            old_file_path: None,
+            before_content: Some(before.to_string()),
+            after_content: Some(after.to_string()),
+        }];
+        compute_semantic_diff(&changes, &registry, None, None).changes
+    }
 
     #[test]
     fn test_json_line_positions() {
@@ -458,13 +473,8 @@ mod tests {
   }
 }
 "#;
-        let plugin = JsonParserPlugin;
-        let before_entities = plugin.extract_entities(before, "package.json");
-        let after_entities = plugin.extract_entities(after, "package.json");
-
-        let result = match_entities(&before_entities, &after_entities, "package.json", None, None, None);
-        let renames: Vec<_> = result
-            .changes
+        let changes = json_diff(before, after);
+        let renames: Vec<_> = changes
             .iter()
             .filter(|c| c.change_type == ChangeType::Renamed)
             .collect();
@@ -531,15 +541,12 @@ mod tests {
 
     #[test]
     fn test_rename_detected_end_to_end() {
-        let before_content = "{\n  \"timeout\": 30\n}\n";
-        let after_content = "{\n  \"request_timeout\": 30\n}\n";
-        let plugin = JsonParserPlugin;
-        let before = plugin.extract_entities(before_content, "config.json");
-        let after = plugin.extract_entities(after_content, "config.json");
-        let result = match_entities(&before, &after, "config.json", None, None, None);
-        assert_eq!(result.changes.len(), 1);
-        assert_eq!(result.changes[0].change_type, ChangeType::Renamed);
-        assert_eq!(result.changes[0].entity_name, "request_timeout");
+        let before = "{\n  \"timeout\": 30\n}\n";
+        let after = "{\n  \"request_timeout\": 30\n}\n";
+        let changes = json_diff(before, after);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].change_type, ChangeType::Renamed);
+        assert_eq!(changes[0].entity_name, "request_timeout");
     }
 
     #[test]
