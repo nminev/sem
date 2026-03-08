@@ -266,7 +266,129 @@ pub fn match_entities(
         });
     }
 
+    suppress_redundant_parent_modified(&mut changes, before, after);
+
     MatchResult { changes }
+}
+
+/// Strips child entity content from a parent entity's content using line numbers,
+/// then normalizes whitespace. Returns a string representing only the parent's
+/// "own" content (its declaration, signature, etc.) without any child body content.
+fn strip_children_content(
+    content: &str,
+    parent_start_line: usize,
+    children: &[&SemanticEntity],
+) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut excluded: HashSet<usize> = HashSet::new();
+    for child in children {
+        // Convert absolute 1-based line numbers to 0-based indices within this entity's content
+        let start_idx = child.start_line.saturating_sub(parent_start_line);
+        let end_idx = child.end_line.saturating_sub(parent_start_line);
+        for i in start_idx..=end_idx {
+            if i < lines.len() {
+                excluded.insert(i);
+            }
+        }
+    }
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !excluded.contains(i))
+        .map(|(_, l)| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Post-processing pass: remove `Modified` changes for parent entities whose
+/// modification is entirely a side-effect of their children changing.
+///
+/// Example: renaming a method inside a class causes the class `content_hash` to
+/// change (because class content includes method bodies), but the class's own
+/// declaration line didn't change — only a child did. This function suppresses
+/// that spurious `Modified` entry so the output shows only the child's change.
+fn suppress_redundant_parent_modified(
+    changes: &mut Vec<SemanticChange>,
+    before: &[SemanticEntity],
+    after: &[SemanticEntity],
+) {
+    let before_by_id: HashMap<&str, &SemanticEntity> =
+        before.iter().map(|e| (e.id.as_str(), e)).collect();
+    let after_by_id: HashMap<&str, &SemanticEntity> =
+        after.iter().map(|e| (e.id.as_str(), e)).collect();
+
+    // Map parent entity ID → its direct children in before/after
+    let mut before_children: HashMap<&str, Vec<&SemanticEntity>> = HashMap::new();
+    for e in before {
+        if let Some(ref pid) = e.parent_id {
+            before_children.entry(pid.as_str()).or_default().push(e);
+        }
+    }
+    let mut after_children: HashMap<&str, Vec<&SemanticEntity>> = HashMap::new();
+    for e in after {
+        if let Some(ref pid) = e.parent_id {
+            after_children.entry(pid.as_str()).or_default().push(e);
+        }
+    }
+
+    // All entity IDs that appear in any change (across before and after)
+    let changed_ids: HashSet<&str> = changes.iter().map(|c| c.entity_id.as_str()).collect();
+
+    let mut to_suppress: HashSet<String> = HashSet::new();
+
+    for change in changes.iter() {
+        if change.change_type != ChangeType::Modified {
+            continue;
+        }
+        let eid = change.entity_id.as_str();
+
+        let b_children = before_children.get(eid).map(|v| v.as_slice()).unwrap_or(&[]);
+        let a_children = after_children.get(eid).map(|v| v.as_slice()).unwrap_or(&[]);
+
+        // Only consider container entities (those that have children)
+        if b_children.is_empty() && a_children.is_empty() {
+            continue;
+        }
+
+        // At least one child must have a change to justify suppression
+        let has_changed_child = b_children.iter().any(|c| changed_ids.contains(c.id.as_str()))
+            || a_children.iter().any(|c| changed_ids.contains(c.id.as_str()));
+        if !has_changed_child {
+            continue;
+        }
+
+        let before_parent = match before_by_id.get(eid) {
+            Some(e) => e,
+            None => continue,
+        };
+        let after_parent = match after_by_id.get(eid) {
+            Some(e) => e,
+            None => continue,
+        };
+
+        // Strip child content from both sides and compare what remains.
+        // If the parent's own content (declaration, fields, etc.) is unchanged,
+        // the Modified is purely a consequence of child changes — suppress it.
+        let before_own = strip_children_content(
+            &before_parent.content,
+            before_parent.start_line,
+            b_children,
+        );
+        let after_own = strip_children_content(
+            &after_parent.content,
+            after_parent.start_line,
+            a_children,
+        );
+
+        if before_own == after_own {
+            to_suppress.insert(change.entity_id.clone());
+        }
+    }
+
+    changes.retain(|c| {
+        !(c.change_type == ChangeType::Modified && to_suppress.contains(&c.entity_id))
+    });
 }
 
 /// Default content similarity using Jaccard index on whitespace-split tokens
@@ -362,5 +484,225 @@ mod tests {
         let score = default_similarity(&a, &b);
         assert!(score > 0.5);
         assert!(score < 1.0);
+    }
+
+    // ---- suppress_redundant_parent_modified tests ----
+
+    fn make_entity_with_parent(
+        id: &str,
+        name: &str,
+        content: &str,
+        file_path: &str,
+        parent_id: Option<&str>,
+        start_line: usize,
+        end_line: usize,
+    ) -> SemanticEntity {
+        SemanticEntity {
+            id: id.to_string(),
+            file_path: file_path.to_string(),
+            entity_type: "function".to_string(),
+            name: name.to_string(),
+            parent_id: parent_id.map(String::from),
+            content: content.to_string(),
+            content_hash: content_hash(content),
+            structural_hash: None,
+            start_line,
+            end_line,
+            metadata: None,
+        }
+    }
+
+    // A realistic method body with enough tokens that Jaccard similarity stays >0.8
+    // even when only the method name differs (one token changes out of ~15 unique).
+    const METHOD_BODY: &str =
+        "x = 1\n    y = 2\n    z = 3\n    w = x + y\n    return w + z";
+
+    /// When a child is renamed, the parent should NOT appear as Modified.
+    #[test]
+    fn test_parent_not_modified_when_child_renamed() {
+        let before_method_content =
+            format!("def old_method(self):\n    {METHOD_BODY}");
+        let after_method_content =
+            format!("def new_method(self):\n    {METHOD_BODY}");
+        let before_class_content =
+            format!("class Svc:\n    {before_method_content}");
+        let after_class_content =
+            format!("class Svc:\n    {after_method_content}");
+
+        let before_class = make_entity_with_parent(
+            "a.py::class::Svc", "Svc", &before_class_content, "a.py", None, 1, 6,
+        );
+        let before_method = make_entity_with_parent(
+            "a.py::a.py::class::Svc::old_method",
+            "old_method",
+            &before_method_content,
+            "a.py",
+            Some("a.py::class::Svc"),
+            2,
+            6,
+        );
+        let after_class = make_entity_with_parent(
+            "a.py::class::Svc", "Svc", &after_class_content, "a.py", None, 1, 6,
+        );
+        let after_method = make_entity_with_parent(
+            "a.py::a.py::class::Svc::new_method",
+            "new_method",
+            &after_method_content,
+            "a.py",
+            Some("a.py::class::Svc"),
+            2,
+            6,
+        );
+
+        let before = vec![before_class, before_method];
+        let after = vec![after_class, after_method];
+
+        let result = match_entities(
+            &before,
+            &after,
+            "a.py",
+            Some(&default_similarity),
+            None,
+            None,
+        );
+
+        let types: Vec<ChangeType> = result.changes.iter().map(|c| c.change_type).collect();
+        assert!(types.contains(&ChangeType::Renamed), "expected method Renamed");
+        assert!(
+            !types.contains(&ChangeType::Modified),
+            "parent class should not appear as Modified when only child renamed"
+        );
+    }
+
+    /// When a method is added to a class, the class should NOT appear as Modified.
+    #[test]
+    fn test_parent_not_modified_when_child_added() {
+        let method_content = format!("def bar(self):\n    {METHOD_BODY}");
+        let new_method_content = format!("def baz(self):\n    {METHOD_BODY}");
+
+        let before_class = make_entity_with_parent(
+            "a.py::class::Svc",
+            "Svc",
+            &format!("class Svc:\n    {method_content}"),
+            "a.py",
+            None,
+            1,
+            6,
+        );
+        let before_method = make_entity_with_parent(
+            "a.py::a.py::class::Svc::bar",
+            "bar",
+            &method_content,
+            "a.py",
+            Some("a.py::class::Svc"),
+            2,
+            6,
+        );
+        let after_class = make_entity_with_parent(
+            "a.py::class::Svc",
+            "Svc",
+            &format!("class Svc:\n    {method_content}\n    {new_method_content}"),
+            "a.py",
+            None,
+            1,
+            12,
+        );
+        let after_method_bar = make_entity_with_parent(
+            "a.py::a.py::class::Svc::bar",
+            "bar",
+            &method_content,
+            "a.py",
+            Some("a.py::class::Svc"),
+            2,
+            6,
+        );
+        let after_method_baz = make_entity_with_parent(
+            "a.py::a.py::class::Svc::baz",
+            "baz",
+            &new_method_content,
+            "a.py",
+            Some("a.py::class::Svc"),
+            7,
+            12,
+        );
+
+        let before = vec![before_class, before_method];
+        let after = vec![after_class, after_method_bar, after_method_baz];
+
+        let result = match_entities(&before, &after, "a.py", None, None, None);
+
+        let types: Vec<ChangeType> = result.changes.iter().map(|c| c.change_type).collect();
+        assert!(types.contains(&ChangeType::Added), "expected new method Added");
+        assert!(
+            !types.contains(&ChangeType::Modified),
+            "parent class should not appear as Modified when only child added"
+        );
+    }
+
+    /// When the class's own declaration changes (e.g. base class added) in addition
+    /// to a child rename, the parent SHOULD remain as Modified.
+    #[test]
+    fn test_parent_still_modified_when_own_content_changes() {
+        let before_method_content =
+            format!("def old_method(self):\n    {METHOD_BODY}");
+        let after_method_content =
+            format!("def new_method(self):\n    {METHOD_BODY}");
+
+        // Before: "class Svc:" — After: "class Svc(Base):" — declaration changed
+        let before_class = make_entity_with_parent(
+            "a.py::class::Svc",
+            "Svc",
+            &format!("class Svc:\n    {before_method_content}"),
+            "a.py",
+            None,
+            1,
+            6,
+        );
+        let before_method = make_entity_with_parent(
+            "a.py::a.py::class::Svc::old_method",
+            "old_method",
+            &before_method_content,
+            "a.py",
+            Some("a.py::class::Svc"),
+            2,
+            6,
+        );
+        let after_class = make_entity_with_parent(
+            "a.py::class::Svc",
+            "Svc",
+            &format!("class Svc(Base):\n    {after_method_content}"),
+            "a.py",
+            None,
+            1,
+            6,
+        );
+        let after_method = make_entity_with_parent(
+            "a.py::a.py::class::Svc::new_method",
+            "new_method",
+            &after_method_content,
+            "a.py",
+            Some("a.py::class::Svc"),
+            2,
+            6,
+        );
+
+        let before = vec![before_class, before_method];
+        let after = vec![after_class, after_method];
+
+        let result = match_entities(
+            &before,
+            &after,
+            "a.py",
+            Some(&default_similarity),
+            None,
+            None,
+        );
+
+        let types: Vec<ChangeType> = result.changes.iter().map(|c| c.change_type).collect();
+        assert!(types.contains(&ChangeType::Renamed), "expected method Renamed");
+        assert!(
+            types.contains(&ChangeType::Modified),
+            "parent class should still be Modified when its own declaration changed"
+        );
     }
 }
