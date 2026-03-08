@@ -67,7 +67,7 @@ fn extract_entries_recursive(
         let abs_start = line_offset + entry.start_line - 1;
         let abs_end = line_offset + end_line - 1;
 
-        let entity_id = build_entity_id(file_path, &entry.entity_type, &pointer, parent_entity_id);
+        let entity_id = build_entity_id(file_path, &entry.entity_type, &pointer, None);
 
         out.push(SemanticEntity {
             id: entity_id.clone(),
@@ -289,7 +289,7 @@ fn find_top_level_entries(content: &str) -> Vec<JsonEntry> {
                 depth += 1;
                 if depth == 2 && key_start {
                     if let Some(entry) = entries.last_mut() {
-                        entry.entity_type = "object".to_string();
+                        entry.entity_type = if ch == '{' { "object" } else { "array" }.to_string();
                     }
                 }
             }
