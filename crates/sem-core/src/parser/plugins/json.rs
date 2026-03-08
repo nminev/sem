@@ -483,62 +483,6 @@ mod tests {
         assert_eq!(renames[0].entity_name, "compile");
     }
 
-    // --- Bug regression tests ---
-
-    /// Arrays of objects should NOT produce child entities.
-    /// `find_top_level_entries` sets entity_type="object" for `[` the same as `{`,
-    /// so `extract_object_value` finds the first `{` *inside* the array and recurses
-    /// into that element, creating spurious children.
-    #[test]
-    fn test_array_of_objects_produces_no_child_entities() {
-        let content = r#"{
-  "deps": [
-    {"name": "react"},
-    {"name": "vue"}
-  ]
-}"#;
-        let plugin = JsonParserPlugin;
-        let entities = plugin.extract_entities(content, "package.json");
-
-        let deps = entities.iter().find(|e| e.name == "deps").expect("deps entity should exist");
-        let children: Vec<_> = entities
-            .iter()
-            .filter(|e| e.parent_id.as_deref() == Some(deps.id.as_str()))
-            .collect();
-
-        assert!(
-            children.is_empty(),
-            "array value should not produce child entities, but got: {:?}",
-            children.iter().map(|e| e.name.as_str()).collect::<Vec<_>>()
-        );
-    }
-
-    /// Nested entity IDs should not contain redundant/duplicated segments.
-    /// `build_entity_id` with a parent_id uses `format!("{file_path}::{pid}::{name}")`,
-    /// which embeds the full parent ID (already containing the file path) into the child ID.
-    /// Expected: `"package.json::property::/scripts/build"`
-    /// Actual:   `"package.json::package.json::object::/scripts::/scripts/build"`
-    #[test]
-    fn test_nested_entity_id_is_not_redundant() {
-        let content = r#"{
-  "scripts": {
-    "build": "tsc"
-  }
-}"#;
-        let plugin = JsonParserPlugin;
-        let entities = plugin.extract_entities(content, "package.json");
-
-        let build = entities.iter().find(|e| e.name == "build").expect("build entity should exist");
-        assert_eq!(
-            build.id,
-            "package.json::property::/scripts/build",
-            "nested entity ID should be a clean non-redundant path; actual: {:?}",
-            build.id
-        );
-    }
-
-    // --- End bug regression tests ---
-
     #[test]
     fn test_rename_detected_end_to_end() {
         let before = "{\n  \"timeout\": 30\n}\n";
@@ -550,31 +494,126 @@ mod tests {
     }
 
     #[test]
-    fn test_renamed_scalar_property_shares_structural_hash() {
-        let before_content = "{\n  \"timeout\": 30\n}\n";
-        let after_content = "{\n  \"request_timeout\": 30\n}\n";
-        let plugin = JsonParserPlugin;
-        let before = plugin.extract_entities(before_content, "config.json");
-        let after = plugin.extract_entities(after_content, "config.json");
-        assert_eq!(before.len(), 1);
-        assert_eq!(after.len(), 1);
-        assert_ne!(before[0].content_hash, after[0].content_hash);
-        assert_eq!(before[0].structural_hash, after[0].structural_hash);
+    fn test_object_key_rename_detected() {
+        // Rename a top-level object key with identical content → should be Renamed not Deleted+Added
+        let before = "{\n  \"config\": {\n    \"port\": 8080\n  }\n}\n";
+        let after = "{\n  \"settings\": {\n    \"port\": 8080\n  }\n}\n";
+        let changes = json_diff(before, after);
+        let renames: Vec<_> = changes.iter().filter(|c| c.change_type == ChangeType::Renamed).collect();
+        let settings_rename = renames.iter().find(|c| c.entity_name == "settings");
+        assert!(
+            settings_rename.is_some(),
+            "expected 'settings' to be detected as Renamed, got: {:?}",
+            changes.iter().map(|c| (&c.entity_name, &c.change_type)).collect::<Vec<_>>()
+        );
     }
 
+    // --- Bug regression tests (these fail until the bugs are fixed) ---
+
+    /// BUG: Renaming a key inside an array element produces a spurious Renamed event.
+    /// Array element keys have no stable identity and should never be tracked as entities.
+    /// `find_top_level_entries` treats `[` the same as `{`, so the parser recurses into
+    /// the first array element and creates a ghost entity with empty content.
+    /// Because the ghost entity always has content_hash=hash(""), Phase 2 matches any
+    /// two ghost entities with different key names as a Renamed change.
     #[test]
-    fn test_renamed_object_property_shares_structural_hash() {
-        let before_content = "{\n  \"config\": {\n    \"port\": 8080\n  }\n}\n";
-        let after_content = "{\n  \"settings\": {\n    \"port\": 8080\n  }\n}\n";
-        let plugin = JsonParserPlugin;
-        let before = plugin.extract_entities(before_content, "config.json");
-        let after = plugin.extract_entities(after_content, "config.json");
-        // top-level entity
-        let before_top: Vec<_> = before.iter().filter(|e| e.parent_id.is_none()).collect();
-        let after_top: Vec<_> = after.iter().filter(|e| e.parent_id.is_none()).collect();
-        assert_eq!(before_top.len(), 1);
-        assert_eq!(after_top.len(), 1);
-        assert_ne!(before_top[0].content_hash, after_top[0].content_hash);
-        assert_eq!(before_top[0].structural_hash, after_top[0].structural_hash);
+    fn test_array_element_key_rename_not_tracked() {
+        let before = r#"{
+  "deps": [
+    {"name": "react"},
+    {"name": "vue"}
+  ]
+}"#;
+        let after = r#"{
+  "deps": [
+    {"package": "react"},
+    {"name": "vue"}
+  ]
+}"#;
+        let changes = json_diff(before, after);
+        let renames: Vec<_> = changes.iter().filter(|c| c.change_type == ChangeType::Renamed).collect();
+        assert!(
+            renames.is_empty(),
+            "array element keys should not produce rename events, got: {:?}",
+            renames.iter().map(|c| c.entity_name.as_str()).collect::<Vec<_>>()
+        );
+        // Only deps itself should be reported as modified
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].entity_name, "deps");
+        assert_eq!(changes[0].change_type, ChangeType::Modified);
+    }
+
+    /// BUG: The entity_id for nested entities in diff output is redundant.
+    /// `build_entity_id` with a parent_id formats as `{file}::{parent_id}::{pointer}`,
+    /// embedding the full parent ID so the file path and parent pointer both repeat.
+    /// Expected entity_id: `"test.json::property::/scripts/build"`
+    /// Actual entity_id:   `"test.json::test.json::object::/scripts::/scripts/build"`
+    #[test]
+    fn test_nested_entity_id_in_diff_output() {
+        let before = r#"{
+  "scripts": {
+    "build": "tsc"
+  }
+}"#;
+        let after = r#"{
+  "scripts": {
+    "build": "webpack"
+  }
+}"#;
+        let changes = json_diff(before, after);
+        let build_change = changes.iter().find(|c| c.entity_name == "build")
+            .expect("expected a change for the build entity");
+        assert_eq!(
+            build_change.entity_id,
+            "test.json::property::/scripts/build",
+            "nested entity_id in diff output should be a clean non-redundant path; actual: {:?}",
+            build_change.entity_id
+        );
+    }
+
+    // --- End bug regression tests ---
+
+    /// Phase 3 (fuzzy similarity) catches a rename when the key is renamed AND
+    /// the value changes slightly — so structural_hash differs and Phase 2 misses it.
+    /// The object has enough shared tokens that Jaccard similarity > 0.8 threshold.
+    #[test]
+    fn test_fuzzy_rename_detected_via_phase_3() {
+        // "config" → "settings": key renamed (Phase 1 & 2 both miss it)
+        // "timeout": 30 → 60: value changed (rules out Phase 2 on the parent)
+        // 9 other fields unchanged: enough shared tokens for Jaccard > 0.8 (Phase 3 catches it)
+        let before = r#"{
+  "config": {
+    "port": 8080,
+    "host": "localhost",
+    "protocol": "https",
+    "retries": 3,
+    "timeout": 30,
+    "keepalive": true,
+    "compression": true,
+    "logging": "verbose",
+    "maxConnections": 100
+  }
+}"#;
+        let after = r#"{
+  "settings": {
+    "port": 8080,
+    "host": "localhost",
+    "protocol": "https",
+    "retries": 3,
+    "timeout": 60,
+    "keepalive": true,
+    "compression": true,
+    "logging": "verbose",
+    "maxConnections": 100
+  }
+}"#;
+        let changes = json_diff(before, after);
+        let renames: Vec<_> = changes.iter().filter(|c| c.change_type == ChangeType::Renamed).collect();
+        let settings_rename = renames.iter().find(|c| c.entity_name == "settings");
+        assert!(
+            settings_rename.is_some(),
+            "expected 'settings' to be detected as Renamed via fuzzy similarity; changes: {:?}",
+            changes.iter().map(|c| (&c.entity_name, &c.change_type)).collect::<Vec<_>>()
+        );
     }
 }
