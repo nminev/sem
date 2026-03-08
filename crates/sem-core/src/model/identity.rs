@@ -3,6 +3,14 @@ use std::collections::{HashMap, HashSet};
 use super::change::{ChangeType, SemanticChange};
 use super::entity::SemanticEntity;
 
+/// Extracts the leaf name from a parent_id string.
+/// parent_id format: "{file_path}::{entity_type}::{name}" (for top-level parents)
+/// The name is always the last "::" segment.
+fn parent_name(entity: &SemanticEntity) -> Option<String> {
+    let pid = entity.parent_id.as_ref()?;
+    pid.rsplit("::").next().map(String::from)
+}
+
 pub struct MatchResult {
     pub changes: Vec<SemanticChange>,
 }
@@ -45,6 +53,7 @@ pub fn match_entities(
                     change_type: ChangeType::Modified,
                     entity_type: after_entity.entity_type.clone(),
                     entity_name: after_entity.name.clone(),
+                    parent_name: parent_name(after_entity),
                     file_path: after_entity.file_path.clone(),
                     old_file_path: None,
                     before_content: Some(before_entity.content.clone()),
@@ -125,6 +134,7 @@ pub fn match_entities(
                 change_type,
                 entity_type: after_entity.entity_type.clone(),
                 entity_name: after_entity.name.clone(),
+                parent_name: parent_name(after_entity),
                 file_path: after_entity.file_path.clone(),
                 old_file_path,
                 before_content: Some(before_entity.content.clone()),
@@ -214,6 +224,7 @@ pub fn match_entities(
                         change_type,
                         entity_type: after_entity.entity_type.clone(),
                         entity_name: after_entity.name.clone(),
+                        parent_name: parent_name(after_entity),
                         file_path: after_entity.file_path.clone(),
                         old_file_path,
                         before_content: Some(matched.content.clone()),
@@ -236,6 +247,7 @@ pub fn match_entities(
             change_type: ChangeType::Deleted,
             entity_type: entity.entity_type.clone(),
             entity_name: entity.name.clone(),
+            parent_name: parent_name(entity),
             file_path: entity.file_path.clone(),
             old_file_path: None,
             before_content: Some(entity.content.clone()),
@@ -255,6 +267,7 @@ pub fn match_entities(
             change_type: ChangeType::Added,
             entity_type: entity.entity_type.clone(),
             entity_name: entity.name.clone(),
+            parent_name: parent_name(entity),
             file_path: entity.file_path.clone(),
             old_file_path: None,
             before_content: None,
