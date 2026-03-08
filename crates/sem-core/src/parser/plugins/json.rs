@@ -473,6 +473,62 @@ mod tests {
         assert_eq!(renames[0].entity_name, "compile");
     }
 
+    // --- Bug regression tests ---
+
+    /// Arrays of objects should NOT produce child entities.
+    /// `find_top_level_entries` sets entity_type="object" for `[` the same as `{`,
+    /// so `extract_object_value` finds the first `{` *inside* the array and recurses
+    /// into that element, creating spurious children.
+    #[test]
+    fn test_array_of_objects_produces_no_child_entities() {
+        let content = r#"{
+  "deps": [
+    {"name": "react"},
+    {"name": "vue"}
+  ]
+}"#;
+        let plugin = JsonParserPlugin;
+        let entities = plugin.extract_entities(content, "package.json");
+
+        let deps = entities.iter().find(|e| e.name == "deps").expect("deps entity should exist");
+        let children: Vec<_> = entities
+            .iter()
+            .filter(|e| e.parent_id.as_deref() == Some(deps.id.as_str()))
+            .collect();
+
+        assert!(
+            children.is_empty(),
+            "array value should not produce child entities, but got: {:?}",
+            children.iter().map(|e| e.name.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Nested entity IDs should not contain redundant/duplicated segments.
+    /// `build_entity_id` with a parent_id uses `format!("{file_path}::{pid}::{name}")`,
+    /// which embeds the full parent ID (already containing the file path) into the child ID.
+    /// Expected: `"package.json::property::/scripts/build"`
+    /// Actual:   `"package.json::package.json::object::/scripts::/scripts/build"`
+    #[test]
+    fn test_nested_entity_id_is_not_redundant() {
+        let content = r#"{
+  "scripts": {
+    "build": "tsc"
+  }
+}"#;
+        let plugin = JsonParserPlugin;
+        let entities = plugin.extract_entities(content, "package.json");
+
+        let build = entities.iter().find(|e| e.name == "build").expect("build entity should exist");
+        assert_eq!(
+            build.id,
+            "package.json::property::/scripts/build",
+            "nested entity ID should be a clean non-redundant path; actual: {:?}",
+            build.id
+        );
+    }
+
+    // --- End bug regression tests ---
+
     #[test]
     fn test_rename_detected_end_to_end() {
         let before_content = "{\n  \"timeout\": 30\n}\n";
