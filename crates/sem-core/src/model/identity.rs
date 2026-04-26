@@ -295,6 +295,12 @@ fn strip_children_content(
     let lines: Vec<&str> = content.lines().collect();
     let mut excluded: HashSet<usize> = HashSet::new();
     for child in children {
+        debug_assert!(
+            child.start_line >= parent_start_line,
+            "child start_line ({}) < parent start_line ({}): extraction bug",
+            child.start_line,
+            parent_start_line
+        );
         // Convert absolute 1-based line numbers to 0-based indices within this entity's content
         let start_idx = child.start_line.saturating_sub(parent_start_line);
         let end_idx = child.end_line.saturating_sub(parent_start_line);
@@ -716,6 +722,96 @@ mod tests {
         assert!(
             types.contains(&ChangeType::Modified),
             "parent class should still be Modified when its own declaration changed"
+        );
+    }
+
+    /// `parent_name` is None for top-level entities and Some("ClassName") for nested ones.
+    #[test]
+    fn test_parent_name_populated_on_changes() {
+        let method_content = format!("def bar(self):\n    {METHOD_BODY}");
+
+        let before_class = make_entity_with_parent(
+            "a.py::class::Svc", "Svc",
+            &format!("class Svc:\n    {method_content}"),
+            "a.py", None, 1, 6,
+        );
+        let before_method = make_entity_with_parent(
+            "a.py::a.py::class::Svc::bar", "bar", &method_content,
+            "a.py", Some("a.py::class::Svc"), 2, 6,
+        );
+
+        // Modify the method body so it shows as Modified
+        let after_method_content = format!("def bar(self):\n    {METHOD_BODY}\n    return 0");
+        let after_class = make_entity_with_parent(
+            "a.py::class::Svc", "Svc",
+            &format!("class Svc:\n    {after_method_content}"),
+            "a.py", None, 1, 7,
+        );
+        let after_method = make_entity_with_parent(
+            "a.py::a.py::class::Svc::bar", "bar", &after_method_content,
+            "a.py", Some("a.py::class::Svc"), 2, 7,
+        );
+
+        let before = vec![before_class, before_method];
+        let after = vec![after_class, after_method];
+        let result = match_entities(&before, &after, "a.py", None, None, None);
+
+        let method_change = result.changes.iter()
+            .find(|c| c.entity_name == "bar")
+            .expect("expected change for bar");
+
+        assert_eq!(method_change.change_type, ChangeType::Modified);
+        assert_eq!(
+            method_change.parent_name.as_deref(),
+            Some("Svc"),
+            "nested method should carry parent class name"
+        );
+
+        // Top-level entity (the class itself) should not appear due to suppression,
+        // but if we check a top-level entity directly it should have no parent_name.
+        let top_level = make_entity("a.py::function::standalone", "standalone", "def standalone(): pass", "a.py");
+        let top_level_after = make_entity("a.py::function::standalone", "standalone", "def standalone(): return 1", "a.py");
+        let top_result = match_entities(&[top_level], &[top_level_after], "a.py", None, None, None);
+        assert_eq!(top_result.changes.len(), 1);
+        assert_eq!(
+            top_result.changes[0].parent_name,
+            None,
+            "top-level entity should have no parent_name"
+        );
+    }
+
+    /// When all children are deleted the parent body changes structurally,
+    /// so the parent should remain visible as Modified.
+    #[test]
+    fn test_parent_still_modified_when_all_children_deleted() {
+        let method_content = format!("def bar(self):\n    {METHOD_BODY}");
+
+        let before_class = make_entity_with_parent(
+            "a.py::class::Svc", "Svc",
+            &format!("class Svc:\n    {method_content}"),
+            "a.py", None, 1, 6,
+        );
+        let before_method = make_entity_with_parent(
+            "a.py::a.py::class::Svc::bar", "bar", &method_content,
+            "a.py", Some("a.py::class::Svc"), 2, 6,
+        );
+
+        // After: class body is now just `pass` — completely different from before
+        let after_class = make_entity_with_parent(
+            "a.py::class::Svc", "Svc",
+            "class Svc:\n    pass",
+            "a.py", None, 1, 2,
+        );
+
+        let before = vec![before_class, before_method];
+        let after = vec![after_class];
+        let result = match_entities(&before, &after, "a.py", None, None, None);
+
+        let types: Vec<ChangeType> = result.changes.iter().map(|c| c.change_type).collect();
+        assert!(types.contains(&ChangeType::Deleted), "method should be Deleted");
+        assert!(
+            types.contains(&ChangeType::Modified),
+            "parent class should remain Modified when all children are deleted and body changes"
         );
     }
 }
