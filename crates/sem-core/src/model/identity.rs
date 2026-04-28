@@ -3,9 +3,29 @@ use std::collections::{HashMap, HashSet};
 use super::change::{ChangeType, SemanticChange};
 use super::entity::SemanticEntity;
 
-fn parent_name(entity: &SemanticEntity) -> Option<String> {
-    let pid = entity.parent_id.as_ref()?;
-    pid.rsplit("::").next().map(String::from)
+fn parent_name(
+    entity: &SemanticEntity,
+    by_id: &HashMap<&str, &SemanticEntity>,
+) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut pid = entity.parent_id.as_deref()?;
+    loop {
+        match by_id.get(pid) {
+            Some(parent) => {
+                parts.push(parent.name.as_str());
+                match parent.parent_id.as_deref() {
+                    Some(next) => pid = next,
+                    None => break,
+                }
+            }
+            None => break,
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    parts.reverse();
+    Some(parts.join("::"))
 }
 
 pub struct MatchResult {
@@ -28,6 +48,7 @@ fn make_change(
     before_entity: Option<&SemanticEntity>,
     commit_sha: Option<&str>,
     author: Option<&str>,
+    by_id: &HashMap<&str, &SemanticEntity>,
 ) -> SemanticChange {
     let prefix = match change_type {
         ChangeType::Added => "added::",
@@ -48,7 +69,7 @@ fn make_change(
         entity_type: primary.entity_type.clone(),
         entity_name: primary.name.clone(),
         entity_line: primary.start_line,
-        parent_name: parent_name(primary),
+        parent_name: parent_name(primary, by_id),
         file_path: primary.file_path.clone(),
         old_entity_name: before_entity.and_then(|b| {
             (b.name != after_entity.name).then(|| b.name.clone())
@@ -93,6 +114,14 @@ pub fn match_entities(
     let after_by_id: HashMap<&str, &SemanticEntity> =
         after.iter().map(|e| (e.id.as_str(), e)).collect();
 
+    // Combined map for ancestor-chain lookup: after takes precedence so the
+    // displayed path reflects the post-change tree for non-deleted entities.
+    let combined_by_id: HashMap<&str, &SemanticEntity> = before
+        .iter()
+        .map(|e| (e.id.as_str(), e))
+        .chain(after.iter().map(|e| (e.id.as_str(), e)))
+        .collect();
+
     // Phase 1: Exact ID match
     for (&id, after_entity) in &after_by_id {
         if let Some(before_entity) = before_by_id.get(id) {
@@ -100,7 +129,7 @@ pub fn match_entities(
             matched_after.insert(id);
 
             if before_entity.content_hash != after_entity.content_hash {
-                let mut change = make_change(after_entity, ChangeType::Modified, Some(before_entity), commit_sha, author);
+                let mut change = make_change(after_entity, ChangeType::Modified, Some(before_entity), commit_sha, author, &combined_by_id);
                 change.structural_change = match (&before_entity.structural_hash, &after_entity.structural_hash) {
                     (Some(before_sh), Some(after_sh)) => Some(before_sh != after_sh),
                     _ => None,
@@ -170,7 +199,7 @@ pub fn match_entities(
                 continue;
             }
 
-            changes.push(make_change(after_entity, classify_match(before_entity, after_entity), Some(before_entity), commit_sha, author));
+            changes.push(make_change(after_entity, classify_match(before_entity, after_entity), Some(before_entity), commit_sha, author, &combined_by_id));
         }
     }
 
@@ -268,7 +297,7 @@ pub fn match_entities(
                     continue;
                 }
 
-                changes.push(make_change(after_entity, classify_match(matched, after_entity), Some(matched), commit_sha, author));
+                changes.push(make_change(after_entity, classify_match(matched, after_entity), Some(matched), commit_sha, author, &combined_by_id));
             }
         }
     }
@@ -276,46 +305,16 @@ pub fn match_entities(
     // Phase 4: Intra-file reorder detection
     // For entities that matched by exact ID with identical content (unchanged),
     // check if their relative ordering changed within the file.
-    detect_reorders(before, after, &matched_before, &matched_after, &mut changes, commit_sha, author);
+    detect_reorders(before, after, &matched_before, &matched_after, &mut changes, commit_sha, author, &combined_by_id);
 
     // Remaining unmatched before = deleted
     for entity in before.iter().filter(|e| !matched_before.contains(e.id.as_str())) {
-        changes.push(make_change(entity, ChangeType::Deleted, Some(entity), commit_sha, author));
+        changes.push(make_change(entity, ChangeType::Deleted, Some(entity), commit_sha, author, &combined_by_id));
     }
 
     // Remaining unmatched after = added
     for entity in after.iter().filter(|e| !matched_after.contains(e.id.as_str())) {
-        changes.push(make_change(entity, ChangeType::Added, None, commit_sha, author));
-    }
-
-    // Deduplicate: when a parent (class) is Modified and one or more of its
-    // children (methods) are also Modified, drop the parent. The child diffs
-    // are more specific and the parent body overlaps with them.
-    // Only applies to Modified; Added/Deleted should still show all entities.
-    let modified_ids: HashSet<&str> = changes
-        .iter()
-        .filter(|c| c.change_type == ChangeType::Modified)
-        .map(|c| c.entity_id.as_str())
-        .collect();
-
-    if modified_ids.len() > 1 {
-        let mut parents_to_remove: HashSet<&str> = HashSet::new();
-        for entity in after.iter().chain(before.iter()) {
-            if let Some(ref pid) = entity.parent_id {
-                if modified_ids.contains(entity.id.as_str())
-                    && modified_ids.contains(pid.as_str())
-                {
-                    parents_to_remove.insert(pid.as_str());
-                }
-            }
-        }
-
-        if !parents_to_remove.is_empty() {
-            changes.retain(|c| {
-                !(c.change_type == ChangeType::Modified
-                    && parents_to_remove.contains(c.entity_id.as_str()))
-            });
-        }
+        changes.push(make_change(entity, ChangeType::Added, None, commit_sha, author, &combined_by_id));
     }
 
     MatchResult { changes }
@@ -362,6 +361,7 @@ fn detect_reorders(
     changes: &mut Vec<SemanticChange>,
     commit_sha: Option<&str>,
     author: Option<&str>,
+    by_id: &HashMap<&str, &SemanticEntity>,
 ) {
     // Collect unchanged entities: matched by ID with same content_hash
     let before_by_id: HashMap<&str, &SemanticEntity> =
@@ -412,7 +412,7 @@ fn detect_reorders(
             if lis_set.contains(&i) {
                 continue;
             }
-            changes.push(make_change(after_entity, ChangeType::Reordered, None, commit_sha, author));
+            changes.push(make_change(after_entity, ChangeType::Reordered, None, commit_sha, author, by_id));
         }
     }
 }
@@ -575,10 +575,10 @@ mod tests {
         let after = vec![class_after, method_after];
         let result = match_entities(&before, &after, "a.ts", None, None, None);
 
-        // Should only report the method change, not the class
-        assert_eq!(result.changes.len(), 1);
-        assert_eq!(result.changes[0].entity_name, "genPg");
-        assert_eq!(result.changes[0].change_type, ChangeType::Modified);
+        // match_entities returns both; container-type dedup happens in compute_semantic_diff
+        assert_eq!(result.changes.len(), 2);
+        assert!(result.changes.iter().any(|c| c.entity_name == "genPg" && c.change_type == ChangeType::Modified));
+        assert!(result.changes.iter().any(|c| c.entity_name == "DataStack" && c.change_type == ChangeType::Modified));
     }
 
     #[test]
