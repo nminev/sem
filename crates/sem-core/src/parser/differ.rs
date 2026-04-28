@@ -157,6 +157,10 @@ fn suppress_redundant_parents(
     before: &[SemanticEntity],
     after: &[SemanticEntity],
 ) {
+    // Entity types whose own change is fully explained by a child change.
+    // JSON `array` and any scalar/property type must NOT be added here —
+    // arrays are opaque (no children to suppress against), and scalar
+    // properties carry their value as their own meaningful content.
     const CONTAINER_TYPES: &[&str] = &[
         "impl", "trait", "module", "class", "interface", "mixin",
         "extension", "namespace", "export", "package",

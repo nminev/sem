@@ -872,6 +872,53 @@ mod tests {
         assert_eq!(changes[0].entity_type, "property");
     }
 
+    #[test]
+    fn object_to_array_transition_reports_modified_plus_old_children_deleted() {
+        let changes = json_diff(
+            "{\n  \"deps\": {\n    \"react\": \"18\"\n  }\n}",
+            "{\n  \"deps\": [\"react\"]\n}",
+        );
+        let deps = find_change(&changes, "deps", ChangeType::Modified);
+        assert_eq!(deps.entity_type, "array");
+        find_change(&changes, "react", ChangeType::Deleted);
+    }
+
+    #[test]
+    fn array_to_object_transition_reports_modified_plus_new_children_added() {
+        let changes = json_diff(
+            "{\n  \"deps\": [\"react\"]\n}",
+            "{\n  \"deps\": {\n    \"react\": \"18\"\n  }\n}",
+        );
+        let deps = find_change(&changes, "deps", ChangeType::Modified);
+        assert_eq!(deps.entity_type, "object");
+        let react = find_change(&changes, "react", ChangeType::Added);
+        assert_eq!(react.parent_name.as_deref(), Some("deps"));
+    }
+
+    #[test]
+    fn deep_whole_section_deleted_only_leaf_reported() {
+        let changes = json_diff(
+            "{\n  \"jest\": {\n    \"config\": {\n      \"testTimeout\": 5000\n    }\n  }\n}",
+            "{}",
+        );
+        let timeout = find_change(&changes, "testTimeout", ChangeType::Deleted);
+        assert_eq!(timeout.parent_name.as_deref(), Some("jest::config"));
+        assert!(!changes.iter().any(|c| c.entity_name == "jest" || c.entity_name == "config"),
+            "intermediate containers should be suppressed; got: {:?}", names(&changes));
+    }
+
+    #[test]
+    fn key_with_both_tilde_and_slash_is_pointer_escaped_in_correct_order() {
+        // Per RFC 6901, '~' must be escaped before '/' so 'a~/b' becomes
+        // 'a~0~1b' — not 'a~01b' which would happen if '/' were escaped first.
+        let changes = json_diff(
+            "{\n  \"a~/b\": 1\n}",
+            "{\n  \"a~/b\": 2\n}",
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].entity_id, "test.json::/a~0~1b");
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     //  Document-level edge cases
     // ─────────────────────────────────────────────────────────────────────────
