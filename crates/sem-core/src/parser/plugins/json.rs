@@ -852,6 +852,52 @@ mod tests {
     }
 
     #[test]
+    fn scalar_to_array_transition_reports_modified_only() {
+        // Arrays are opaque so no children are produced on either side.
+        let changes = json_diff(
+            "{\n  \"deps\": \"react\"\n}",
+            "{\n  \"deps\": [\"react\", \"vue\"]\n}",
+        );
+        assert_eq!(names(&changes), vec![("deps".into(), ChangeType::Modified)]);
+        assert_eq!(changes[0].entity_type, "array");
+    }
+
+    #[test]
+    fn array_to_scalar_transition_reports_modified_only() {
+        let changes = json_diff(
+            "{\n  \"deps\": [\"react\", \"vue\"]\n}",
+            "{\n  \"deps\": \"react\"\n}",
+        );
+        assert_eq!(names(&changes), vec![("deps".into(), ChangeType::Modified)]);
+        assert_eq!(changes[0].entity_type, "property");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Document-level edge cases
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn root_array_document_produces_no_entities() {
+        let plugin = JsonParserPlugin;
+        let entities = plugin.extract_entities("[1, 2, 3]", "test.json");
+        assert!(entities.is_empty());
+    }
+
+    #[test]
+    fn root_scalar_document_produces_no_entities() {
+        let plugin = JsonParserPlugin;
+        assert!(plugin.extract_entities("\"hello\"", "test.json").is_empty());
+        assert!(plugin.extract_entities("42", "test.json").is_empty());
+        assert!(plugin.extract_entities("null", "test.json").is_empty());
+    }
+
+    #[test]
+    fn empty_root_object_produces_no_entities() {
+        let plugin = JsonParserPlugin;
+        assert!(plugin.extract_entities("{}", "test.json").is_empty());
+    }
+
+    #[test]
     fn parent_rename_with_child_value_change_falls_back_to_leaf_delete_add() {
         let changes = json_diff(
             "{\n  \"scripts\": {\n    \"dev\": \"vite\"\n  }\n}\n",
