@@ -3,7 +3,6 @@ use serde::Serialize;
 
 use crate::git::types::FileChange;
 use crate::model::change::{ChangeType, SemanticChange};
-use crate::model::entity::SemanticEntity;
 use crate::model::identity::match_entities;
 use crate::parser::registry::ParserRegistry;
 use std::collections::HashSet;
@@ -71,12 +70,6 @@ pub fn compute_semantic_diff(
                 author,
             );
 
-            // Suppress parent entities whose modification is already explained
-            // by child entity changes (e.g. impl blocks when methods changed).
-            let all_entities: Vec<&SemanticEntity> =
-                before_entities.iter().chain(after_entities.iter()).collect();
-            suppress_redundant_parents(&mut result.changes, &all_entities);
-
             result.changes.sort_by_key(|change| change.entity_line);
 
             if result.changes.is_empty() {
@@ -122,34 +115,62 @@ pub fn compute_semantic_diff(
     }
 }
 
-/// Remove "Modified" parent entities from the change list when at least one
-/// child entity also appears as a change.  This avoids showing e.g. an impl
-/// block as modified when the real change is in a method inside it.
-fn suppress_redundant_parents(
-    changes: &mut Vec<SemanticChange>,
-    entities: &[&SemanticEntity],
-) {
-    if changes.len() < 2 {
-        return;
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::types::{FileChange, FileStatus};
+    use crate::parser::plugins::create_default_registry;
 
-    // Build set of entity IDs that have changes
-    let changed_ids: HashSet<&str> = changes.iter().map(|c| c.entity_id.as_str()).collect();
-
-    // Find parent entity IDs that should be suppressed: a parent is redundant
-    // when it is Modified and at least one of its children also has a change.
-    let mut suppress: HashSet<String> = HashSet::new();
-    for entity in entities {
-        if let Some(ref pid) = entity.parent_id {
-            if changed_ids.contains(entity.id.as_str()) && changed_ids.contains(pid.as_str()) {
-                suppress.insert(pid.clone());
-            }
+    fn file_change(path: &str, before: &str, after: &str) -> FileChange {
+        FileChange {
+            file_path: path.to_string(),
+            status: FileStatus::Modified,
+            old_file_path: None,
+            before_content: Some(before.to_string()),
+            after_content: Some(after.to_string()),
         }
     }
 
-    if !suppress.is_empty() {
-        changes.retain(|c| {
-            !(c.change_type == ChangeType::Modified && suppress.contains(&c.entity_id))
-        });
+    /// When only a method body changes and the class declaration is unchanged,
+    /// the class should be suppressed — only the method shows as Modified.
+    #[test]
+    fn test_parent_suppressed_when_only_child_modified() {
+        let before = "class UserService:\n    def get_user(self, user_id):\n        return db.find(user_id)\n";
+        let after  = "class UserService:\n    def get_user(self, user_id):\n        return db.find(user_id, include_deleted=False)\n";
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(&[file_change("svc.py", before, after)], &registry, None, None);
+
+        let names: Vec<&str> = result.changes.iter().map(|c| c.entity_name.as_str()).collect();
+        assert!(
+            result.changes.iter().any(|c| c.entity_name == "get_user" && c.change_type == ChangeType::Modified),
+            "expected method get_user to be Modified, got: {names:?}"
+        );
+        assert!(
+            !result.changes.iter().any(|c| c.entity_name == "UserService" && c.change_type == ChangeType::Modified),
+            "class UserService should be suppressed when only the method body changed, got: {names:?}"
+        );
+    }
+
+    /// When the class declaration itself changes (gains a base class) *and* a child
+    /// method also changes, the parent Modified should NOT be suppressed — both
+    /// changes are meaningful and should appear in the output.
+    #[test]
+    fn test_parent_not_suppressed_when_own_declaration_changes() {
+        let before = "class UserService:\n    def get_user(self, user_id):\n        return db.find(user_id)\n";
+        let after  = "class UserService(BaseService):\n    def get_user(self, user_id):\n        return db.find(user_id, include_deleted=False)\n";
+
+        let registry = create_default_registry();
+        let result = compute_semantic_diff(&[file_change("svc.py", before, after)], &registry, None, None);
+
+        let names: Vec<&str> = result.changes.iter().map(|c| c.entity_name.as_str()).collect();
+        assert!(
+            result.changes.iter().any(|c| c.entity_name == "get_user" && c.change_type == ChangeType::Modified),
+            "expected method get_user to be Modified, got: {names:?}"
+        );
+        assert!(
+            result.changes.iter().any(|c| c.entity_name == "UserService" && c.change_type == ChangeType::Modified),
+            "class UserService should remain Modified when its own declaration changed, got: {names:?}"
+        );
     }
 }
