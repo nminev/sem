@@ -1709,7 +1709,7 @@ static COMMON_LOCAL_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
         "callback", "options", "params", "query", "list",
         "base", "info", "meta", "kind", "mode", "flag",
         "size", "length", "width", "height", "start", "stop",
-        "begin", "done", "found", "status", "code", "test",
+        "begin", "done", "found", "status", "code",
     ].into_iter().collect()
 });
 

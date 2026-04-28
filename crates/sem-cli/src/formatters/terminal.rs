@@ -15,8 +15,8 @@ fn render_inline_diff(old_line: &str, new_line: &str) -> (String, String) {
         let val = change.value();
         match change.tag() {
             ChangeTag::Equal => {
-                del.push_str(&val.red().to_string());
-                ins.push_str(&val.green().to_string());
+                del.push_str(&val.dimmed().to_string());
+                ins.push_str(&val.dimmed().to_string());
             }
             ChangeTag::Delete => {
                 del.push_str(&val.red().strikethrough().bold().to_string());
@@ -44,6 +44,15 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
     }
 
     for (file_path, indices) in &by_file {
+        // Skip files where all changes are orphans in non-verbose mode
+        if !verbose
+            && indices
+                .iter()
+                .all(|&i| result.changes[i].entity_type == "orphan")
+        {
+            continue;
+        }
+
         let header = format!("─ {file_path} ");
         let pad_len = 55usize.saturating_sub(header.len());
         lines.push(format!("┌{header}{}", "─".repeat(pad_len)).dimmed().to_string());
@@ -51,6 +60,12 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
 
         for &idx in indices {
             let change = &result.changes[idx];
+
+            // Orphan changes (module-level) only shown in verbose mode
+            if change.entity_type == "orphan" && !verbose {
+                continue;
+            }
+
             let (symbol, tag) = match change.change_type {
                 ChangeType::Added => (
                     "⊕".green().to_string(),
@@ -81,6 +96,10 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                 ChangeType::Renamed => (
                     "↻".cyan().to_string(),
                     "[renamed]".cyan().to_string(),
+                ),
+                ChangeType::Reordered => (
+                    "↕".magenta().to_string(),
+                    "[reordered]".magenta().to_string(),
                 ),
             };
 
@@ -135,7 +154,7 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                             }
                         }
                     }
-                    ChangeType::Modified => {
+                    ChangeType::Modified | ChangeType::Renamed | ChangeType::Moved => {
                         if let (Some(before), Some(after)) =
                             (&change.before_content, &change.after_content)
                         {
@@ -239,6 +258,14 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
                         "│".dimmed(),
                         format!("from {old_path}").dimmed(),
                     ));
+                } else if let Some(ref old_parent) = change.old_parent_id {
+                    // Intra-file move: extract parent name from entity ID
+                    let parent_name = old_parent.rsplit("::").next().unwrap_or(old_parent);
+                    lines.push(format!(
+                        "{}    {}",
+                        "│".dimmed(),
+                        format!("moved from {parent_name}").dimmed(),
+                    ));
                 }
             }
         }
@@ -270,6 +297,13 @@ pub fn format_terminal(result: &DiffResult, verbose: bool) -> String {
         parts.push(
             format!("{} renamed", result.renamed_count)
                 .cyan()
+                .to_string(),
+        );
+    }
+    if result.reordered_count > 0 {
+        parts.push(
+            format!("{} reordered", result.reordered_count)
+                .magenta()
                 .to_string(),
         );
     }

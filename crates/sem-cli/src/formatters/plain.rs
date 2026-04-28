@@ -27,6 +27,7 @@ pub fn format_plain(result: &DiffResult) -> String {
                 ChangeType::Deleted => "D".red().to_string(),
                 ChangeType::Renamed => "R".cyan().to_string(),
                 ChangeType::Moved => ">".blue().to_string(),
+                ChangeType::Reordered => "O".magenta().to_string(),
             };
 
             let type_label = format!("{:<12}", change.entity_type);
@@ -45,6 +46,9 @@ pub fn format_plain(result: &DiffResult) -> String {
             if matches!(change.change_type, ChangeType::Renamed | ChangeType::Moved) {
                 if let Some(ref old_path) = change.old_file_path {
                     lines.push(format!("       {}", format!("from {old_path}").dimmed()));
+                } else if let Some(ref old_parent) = change.old_parent_id {
+                    let parent_name = old_parent.rsplit("::").next().unwrap_or(old_parent);
+                    lines.push(format!("       {}", format!("moved from {parent_name}").dimmed()));
                 }
             }
         }
@@ -68,6 +72,9 @@ pub fn format_plain(result: &DiffResult) -> String {
     }
     if result.renamed_count > 0 {
         parts.push(format!("{} renamed", result.renamed_count).cyan().to_string());
+    }
+    if result.reordered_count > 0 {
+        parts.push(format!("{} reordered", result.reordered_count).magenta().to_string());
     }
 
     let files_label = if result.file_count == 1 { "file" } else { "files" };

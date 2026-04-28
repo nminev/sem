@@ -2255,11 +2255,11 @@ fn collect_refs_in_range(
                 }
             }
         }
-        if let Some(args) = node.child_by_field_name("arguments") {
-            let mut cursor = args.walk();
-            for child in args.named_children(&mut cursor) {
-                collect_refs_in_range(child, start_row, end_row, entity_id, entity_name, source, refs, config);
-            }
+        // Recurse into ALL children (not just arguments) so chained calls
+        // like foo().bar().baz() and closures in receiver position are found.
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_refs_in_range(child, start_row, end_row, entity_id, entity_name, source, refs, config);
         }
         return;
     }
@@ -2277,11 +2277,9 @@ fn collect_refs_in_range(
                 });
             }
         }
-        if let Some(args) = node.child_by_field_name("arguments") {
-            let mut cursor = args.walk();
-            for child in args.named_children(&mut cursor) {
-                collect_refs_in_range(child, start_row, end_row, entity_id, entity_name, source, refs, config);
-            }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            collect_refs_in_range(child, start_row, end_row, entity_id, entity_name, source, refs, config);
         }
         return;
     }

@@ -8,6 +8,7 @@ pub enum ChangeType {
     Deleted,
     Moved,
     Renamed,
+    Reordered,
 }
 
 impl std::fmt::Display for ChangeType {
@@ -18,12 +19,14 @@ impl std::fmt::Display for ChangeType {
             ChangeType::Deleted => write!(f, "deleted"),
             ChangeType::Moved => write!(f, "moved"),
             ChangeType::Renamed => write!(f, "renamed"),
+            ChangeType::Reordered => write!(f, "reordered"),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct SemanticChange {
     pub id: String,
     pub entity_id: String,
@@ -39,6 +42,8 @@ pub struct SemanticChange {
     pub old_entity_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_file_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_parent_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub before_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

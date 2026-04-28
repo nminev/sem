@@ -462,7 +462,7 @@ fn run_diff_pipeline(
     if file_changes.is_empty() {
         match opts.format {
             OutputFormat::Json => {
-                println!("{{\"summary\":{{\"fileCount\":0,\"added\":0,\"modified\":0,\"deleted\":0,\"moved\":0,\"renamed\":0,\"total\":0}},\"changes\":[]}}");
+                println!("{{\"summary\":{{\"fileCount\":0,\"added\":0,\"modified\":0,\"deleted\":0,\"moved\":0,\"renamed\":0,\"reordered\":0,\"orphan\":0,\"total\":0}},\"changes\":[]}}");
             }
             _ => {
                 println!("\x1b[2mNo semantic changes detected.\x1b[0m");
@@ -503,7 +503,7 @@ fn run_diff_pipeline(
         eprintln!("\x1b[2m  total                {total_ms:>8.2}ms\x1b[0m");
         eprintln!("\x1b[2m  files: {}  entities: {}  changes: {}\x1b[0m",
             file_changes.len(), result.changes.len(),
-            result.added_count + result.modified_count + result.deleted_count + result.moved_count + result.renamed_count);
+            result.added_count + result.modified_count + result.deleted_count + result.moved_count + result.renamed_count + result.reordered_count);
         eprintln!("\x1b[2m─────────────────────────────────────────────\x1b[0m");
     }
 }

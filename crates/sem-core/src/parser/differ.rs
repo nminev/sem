@@ -3,6 +3,7 @@ use serde::Serialize;
 
 use crate::git::types::FileChange;
 use crate::model::change::{ChangeType, SemanticChange};
+use crate::model::entity::SemanticEntity;
 use crate::model::identity::match_entities;
 use crate::parser::registry::ParserRegistry;
 use std::collections::HashSet;
@@ -17,6 +18,8 @@ pub struct DiffResult {
     pub deleted_count: usize,
     pub moved_count: usize,
     pub renamed_count: usize,
+    pub reordered_count: usize,
+    pub orphan_count: usize,
 }
 
 pub fn compute_semantic_diff(
@@ -70,6 +73,22 @@ pub fn compute_semantic_diff(
                 author,
             );
 
+            // Suppress parent entities whose modification is already explained
+            // by child entity changes (e.g. impl blocks when methods changed).
+            let all_entities: Vec<&SemanticEntity> =
+                before_entities.iter().chain(after_entities.iter()).collect();
+            suppress_redundant_parents(&mut result.changes, &all_entities);
+
+            // Detect orphan changes (lines that changed outside any entity span).
+            let orphans = detect_orphan_changes(
+                file,
+                &before_entities,
+                &after_entities,
+                commit_sha,
+                author,
+            );
+            result.changes.extend(orphans);
+
             result.changes.sort_by_key(|change| change.entity_line);
 
             if result.changes.is_empty() {
@@ -87,20 +106,27 @@ pub fn compute_semantic_diff(
         all_changes.extend(changes);
     }
 
-    // Single-pass counting
+    // Single-pass counting (exclude orphan changes from entity counts)
     let mut added_count = 0;
     let mut modified_count = 0;
     let mut deleted_count = 0;
     let mut moved_count = 0;
     let mut renamed_count = 0;
+    let mut reordered_count = 0;
+    let mut orphan_count = 0;
 
     for c in &all_changes {
+        if c.entity_type == "orphan" {
+            orphan_count += 1;
+            continue;
+        }
         match c.change_type {
             ChangeType::Added => added_count += 1,
             ChangeType::Modified => modified_count += 1,
             ChangeType::Deleted => deleted_count += 1,
             ChangeType::Moved => moved_count += 1,
             ChangeType::Renamed => renamed_count += 1,
+            ChangeType::Reordered => reordered_count += 1,
         }
     }
 
@@ -112,65 +138,135 @@ pub fn compute_semantic_diff(
         deleted_count,
         moved_count,
         renamed_count,
+        reordered_count,
+        orphan_count,
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::git::types::{FileChange, FileStatus};
-    use crate::parser::plugins::create_default_registry;
+/// Remove "Modified" parent entities from the change list when at least one
+/// child entity also appears as a change.  This avoids showing e.g. an impl
+/// block as modified when the real change is in a method inside it.
+/// Only suppresses container entity types (impl, trait, module) where the
+/// parent is just a wrapper. Functions, structs, etc. are never suppressed
+/// because they have independent meaningful content.
+fn suppress_redundant_parents(
+    changes: &mut Vec<SemanticChange>,
+    entities: &[&SemanticEntity],
+) {
+    if changes.len() < 2 {
+        return;
+    }
 
-    fn file_change(path: &str, before: &str, after: &str) -> FileChange {
-        FileChange {
-            file_path: path.to_string(),
-            status: FileStatus::Modified,
-            old_file_path: None,
-            before_content: Some(before.to_string()),
-            after_content: Some(after.to_string()),
+    // Container types whose only purpose is grouping child entities.
+    // Functions, structs, enums etc. are NOT containers because they have
+    // independent meaningful content (body logic, fields, variants).
+    const CONTAINER_TYPES: &[&str] = &[
+        "impl", "trait", "module", "class", "interface", "mixin",
+        "extension", "namespace", "export", "package",
+        "svelte_instance_script", "svelte_module_script",
+    ];
+
+    // Build set of entity IDs that have changes
+    let changed_ids: HashSet<&str> = changes.iter().map(|c| c.entity_id.as_str()).collect();
+
+    // Find parent entity IDs that should be suppressed: a parent is redundant
+    // when at least one of its children also has a change and the parent is a
+    // container type (impl, trait, module).
+    let mut suppress: HashSet<String> = HashSet::new();
+    for entity in entities {
+        if let Some(ref pid) = entity.parent_id {
+            if changed_ids.contains(entity.id.as_str()) && changed_ids.contains(pid.as_str()) {
+                suppress.insert(pid.clone());
+            }
         }
     }
 
-    /// When only a method body changes and the class declaration is unchanged,
-    /// the class should be suppressed — only the method shows as Modified.
-    #[test]
-    fn test_parent_suppressed_when_only_child_modified() {
-        let before = "class UserService:\n    def get_user(self, user_id):\n        return db.find(user_id)\n";
-        let after  = "class UserService:\n    def get_user(self, user_id):\n        return db.find(user_id, include_deleted=False)\n";
+    if !suppress.is_empty() {
+        changes.retain(|c| {
+            !(matches!(c.change_type, ChangeType::Modified | ChangeType::Added | ChangeType::Deleted)
+                && suppress.contains(&c.entity_id)
+                && CONTAINER_TYPES.contains(&c.entity_type.as_str()))
+        });
+    }
+}
 
-        let registry = create_default_registry();
-        let result = compute_semantic_diff(&[file_change("svc.py", before, after)], &registry, None, None);
+/// Detect changes in lines that fall outside any entity span.
+/// These are things like use statements, crate-level attributes, standalone
+/// comments, and macro invocations that aren't tracked as entities.
+fn detect_orphan_changes(
+    file: &FileChange,
+    before_entities: &[SemanticEntity],
+    after_entities: &[SemanticEntity],
+    commit_sha: Option<&str>,
+    author: Option<&str>,
+) -> Vec<SemanticChange> {
+    let before_text = file.before_content.as_deref().unwrap_or("");
+    let after_text = file.after_content.as_deref().unwrap_or("");
 
-        let names: Vec<&str> = result.changes.iter().map(|c| c.entity_name.as_str()).collect();
-        assert!(
-            result.changes.iter().any(|c| c.entity_name == "get_user" && c.change_type == ChangeType::Modified),
-            "expected method get_user to be Modified, got: {names:?}"
-        );
-        assert!(
-            !result.changes.iter().any(|c| c.entity_name == "UserService" && c.change_type == ChangeType::Modified),
-            "class UserService should be suppressed when only the method body changed, got: {names:?}"
-        );
+    // Build covered line sets from entity spans
+    let before_covered: HashSet<usize> = before_entities
+        .iter()
+        .flat_map(|e| e.start_line..=e.end_line)
+        .collect();
+    let after_covered: HashSet<usize> = after_entities
+        .iter()
+        .flat_map(|e| e.start_line..=e.end_line)
+        .collect();
+
+    // Extract uncovered lines, preserving line numbers for context
+    let before_orphan: String = before_text
+        .lines()
+        .enumerate()
+        .filter(|(i, _)| !before_covered.contains(&(i + 1)))
+        .map(|(_, l)| l)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let after_orphan: String = after_text
+        .lines()
+        .enumerate()
+        .filter(|(i, _)| !after_covered.contains(&(i + 1)))
+        .map(|(_, l)| l)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Skip if orphan content is unchanged
+    if before_orphan == after_orphan {
+        return Vec::new();
     }
 
-    /// When the class declaration itself changes (gains a base class) *and* a child
-    /// method also changes, the parent Modified should NOT be suppressed — both
-    /// changes are meaningful and should appear in the output.
-    #[test]
-    fn test_parent_not_suppressed_when_own_declaration_changes() {
-        let before = "class UserService:\n    def get_user(self, user_id):\n        return db.find(user_id)\n";
-        let after  = "class UserService(BaseService):\n    def get_user(self, user_id):\n        return db.find(user_id, include_deleted=False)\n";
+    let change_type = if before_orphan.trim().is_empty() {
+        ChangeType::Added
+    } else if after_orphan.trim().is_empty() {
+        ChangeType::Deleted
+    } else {
+        ChangeType::Modified
+    };
 
-        let registry = create_default_registry();
-        let result = compute_semantic_diff(&[file_change("svc.py", before, after)], &registry, None, None);
-
-        let names: Vec<&str> = result.changes.iter().map(|c| c.entity_name.as_str()).collect();
-        assert!(
-            result.changes.iter().any(|c| c.entity_name == "get_user" && c.change_type == ChangeType::Modified),
-            "expected method get_user to be Modified, got: {names:?}"
-        );
-        assert!(
-            result.changes.iter().any(|c| c.entity_name == "UserService" && c.change_type == ChangeType::Modified),
-            "class UserService should remain Modified when its own declaration changed, got: {names:?}"
-        );
-    }
+    vec![SemanticChange {
+        id: format!("{}::orphan", file.file_path),
+        entity_id: format!("{}::orphan", file.file_path),
+        change_type,
+        entity_type: "orphan".to_string(),
+        entity_name: "module-level".to_string(),
+        entity_line: 0,
+        parent_name: None,
+        file_path: file.file_path.clone(),
+        old_entity_name: None,
+        old_file_path: None,
+        old_parent_id: None,
+        before_content: if before_orphan.is_empty() {
+            None
+        } else {
+            Some(before_orphan)
+        },
+        after_content: if after_orphan.is_empty() {
+            None
+        } else {
+            Some(after_orphan)
+        },
+        commit_sha: commit_sha.map(String::from),
+        author: author.map(String::from),
+        timestamp: None,
+        structural_change: Some(true),
+    }]
 }

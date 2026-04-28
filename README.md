@@ -71,6 +71,25 @@ docker build -t sem .
 docker run --rm -it -u "$(id -u):$(id -g)" -v "$(pwd):/repo" sem diff
 ```
 
+## Name conflict with GNU Parallel
+
+GNU Parallel ships a `sem` binary (`/usr/bin/sem`) as a symlink to `parallel`. If you have both installed, they'll collide. Run `sem --version` to check which one you're using. ([#77](https://github.com/Ataraxy-Labs/sem/issues/77))
+
+**Quick fixes:**
+
+```bash
+# Option 1: alias in your shell profile (~/.bashrc, ~/.zshrc)
+alias sem="$HOME/.cargo/bin/sem"
+
+# Option 2: make sure cargo bin comes first in PATH
+export PATH="$HOME/.cargo/bin:$PATH"
+
+# Option 3: if installed via Homebrew
+export PATH="$(brew --prefix)/bin:$PATH"
+```
+
+If you installed via npm/bun, the binary lives in `node_modules/.bin/sem` and is invoked through `npx sem` or `bunx sem`, which avoids the conflict entirely.
+
 ## Commands
 
 Works in any Git repo. No setup required. Also works outside Git for arbitrary file comparison.
@@ -322,7 +341,7 @@ sem-core can be used as a Rust library dependency:
 
 ```toml
 [dependencies]
-sem-core = { git = "https://github.com/Ataraxy-Labs/sem", version = "0.3" }
+sem-core = { git = "https://github.com/Ataraxy-Labs/sem", version = "0.4" }
 ```
 
 Used by [weave](https://github.com/Ataraxy-Labs/weave) (semantic merge driver) and [inspect](https://github.com/Ataraxy-Labs/inspect) (entity-level code review).
