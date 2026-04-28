@@ -181,26 +181,11 @@ reported as Deleted + Added in the new parent path.
 
 ### Parent rename + child also renamed
 
-When both the parent and a child are renamed in the same commit, and the
-child's value is unchanged, both events are reported. The child shows as
-`Moved` (its parent pointer changed) with `old_entity_name` set so the rename
-is visible in display:
-
-```json
-// before                                     // after
-{ "scripts": { "dev": "vite" } }             { "tasks":   { "develop": "vite" } }
-```
-→ `tasks` **Renamed** from `scripts`
-→ `tasks::develop` **Moved** from `scripts::dev` (key renamed, parent renamed, value unchanged)
-
-Display:
-```
-↻ object     scripts -> tasks            [renamed]
-→ property   tasks::dev -> develop       [moved]
-    moved from scripts
-```
-
-The child move is **not** suppressed here because the child's key actually changed.
+This case is governed by the
+[Parent rename when content also changed](#parent-rename-when-content-also-changed)
+limitation — the renamed child key changes the parent's structural_hash, so
+the parent rename itself is not detected. The child move surfaces with both
+`old_entity_name` and `old_parent_id` populated, conveying the rename.
 
 ---
 
@@ -352,10 +337,18 @@ Rules:
 
 ## Known limitations
 
-### Parent rename + content-altering child change
+### Parent rename when content also changed
 
-If a parent object is renamed **and** its child set changes (a sibling is
-added or removed at the same time), the parent rename cannot be detected:
+When a parent object is renamed **and** any of its content also changes in
+the same commit (a sibling added/removed, a child renamed, or a child value
+changed), the parent rename itself cannot be detected. The implementation
+falls back to whatever leaf-level matches Phase 2/3 can recover, then
+container-suppresses the parent Deleted/Added entries.
+
+The user can usually still infer the parent rename from a child's
+`old_parent_id` (footer "moved from ...") and current `parent_name`.
+
+#### Sub-case: sibling added/removed
 
 ```json
 // before                       // after
@@ -367,51 +360,48 @@ added or removed at the same time), the parent rename cannot be detected:
                                 }
 ```
 
-Expected (ideal): `tasks` Renamed from `scripts`, `tasks::test` Added
-Actual output:
+Output:
 ```
-- scripts::build   [deleted]
-+ tasks::build     [added]
-+ tasks::test      [added]
+→ property   tasks::build   [moved]   moved from scripts
+⊕ property   tasks::test    [added]
 ```
 
-**Why:** The `structural_hash` of the parent is computed from its full value
-text. Adding `test` changes that text, so before and after hashes differ and
-Phase 2 cannot match them.
+`build` matches by structural_hash → Moved (parent_id changed). `scripts`
+Deleted and `tasks` Added are container-suppressed because `build`'s
+`old_parent_id` is `scripts` and `test`'s `parent_id` is `tasks`.
 
-**Accepted behaviour:** Parent rename is reported as Deleted + Added when the
-parent's content also changed in the same commit. This applies only when
-*siblings* are added/removed; renaming a child key while keeping the same set
-of children does not change the parent's structural_hash and is handled by
-[Parent rename + child also renamed](#parent-rename--child-also-renamed).
-
-### Parent rename + child value change
-
-When a parent is renamed AND the value of an existing child is also changed
-(child key unchanged), neither the parent rename nor the child connection
-can be recovered:
+#### Sub-case: child key also renamed
 
 ```json
-// before                                   // after
-{ "scripts": { "dev": "vite" } }            { "tasks":   { "dev": "rollup" } }
+{ "scripts": { "dev": "vite" } }    { "tasks": { "develop": "vite" } }
 ```
 
 Output:
 ```
-- scripts::dev   [deleted]
-+ tasks::dev     [added]
+→ property   tasks::dev -> develop   [moved]   moved from scripts
 ```
 
-**Why:** The parent's structural_hash is computed from its value text. Because
-the child value changed, the parent's structural_hash differs between before
-and after, so Phase 2 cannot match the parent — `scripts` and `tasks` become
-Deleted+Added. The child's entity ID changed (parent path differs) and its
-structural_hash changed (value differs), so it is also Deleted+Added.
-Container suppression then drops the parent Deleted/Added entries because
-their children also changed, leaving only the leaf changes.
+The renamed child key changes the parent's structural_hash, so the parent
+rename is missed. The child still matches by structural_hash (value `"vite"`
+unchanged) and surfaces with both `old_entity_name` (the old key) and
+`old_parent_id` (the old parent) populated.
 
-Phase 3 fuzzy matching may rescue the parent rename when child values are
-similar enough, but this is not guaranteed.
+#### Sub-case: child value also changed
+
+```json
+{ "scripts": { "dev": "vite" } }    { "tasks": { "dev": "rollup" } }
+```
+
+Output:
+```
+- property   scripts::dev   [deleted]
++ property   tasks::dev     [added]
+```
+
+Both the parent's structural_hash and the child's structural_hash differ;
+no Phase 2 match is possible at either level. Phase 3 fuzzy matching may
+recover the connection if the surrounding content is similar enough but is
+not guaranteed.
 
 ---
 

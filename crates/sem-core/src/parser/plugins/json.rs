@@ -1,4 +1,4 @@
-use crate::model::entity::{build_entity_id, SemanticEntity};
+use crate::model::entity::SemanticEntity;
 use crate::parser::plugin::SemanticParserPlugin;
 use crate::utils::hash::content_hash;
 
@@ -67,7 +67,9 @@ fn extract_entries_recursive(
         let abs_start = line_offset + entry.start_line - 1;
         let abs_end = line_offset + end_line - 1;
 
-        let entity_id = build_entity_id(file_path, &entry.entity_type, &pointer, None);
+        // JSON entity IDs are file::pointer — entity_type is intentionally not
+        // part of the ID so that scalar↔object value-type changes match as Modified.
+        let entity_id = format!("{}::{}", file_path, pointer);
 
         out.push(SemanticEntity {
             id: entity_id.clone(),
@@ -375,11 +377,13 @@ fn trim_trailing_blanks(lines: &[&str], start: usize, next_start: usize) -> usiz
 mod tests {
     use super::*;
     use crate::git::types::{FileChange, FileStatus};
-    use crate::model::change::ChangeType;
+    use crate::model::change::{ChangeType, SemanticChange};
     use crate::parser::differ::compute_semantic_diff;
     use crate::parser::registry::ParserRegistry;
 
-    fn json_diff(before: &str, after: &str) -> Vec<crate::model::change::SemanticChange> {
+    /// Run the full pipeline and drop orphan changes (which represent line-level
+    /// noise outside entity spans like the root `{` `}` brackets).
+    fn json_diff(before: &str, after: &str) -> Vec<SemanticChange> {
         let mut registry = ParserRegistry::new();
         registry.register(Box::new(JsonParserPlugin));
         let changes = vec![FileChange {
@@ -389,7 +393,20 @@ mod tests {
             before_content: Some(before.to_string()),
             after_content: Some(after.to_string()),
         }];
-        compute_semantic_diff(&changes, &registry, None, None).changes
+        compute_semantic_diff(&changes, &registry, None, None)
+            .changes
+            .into_iter()
+            .filter(|c| c.entity_type != "orphan")
+            .collect()
+    }
+
+    fn names(changes: &[SemanticChange]) -> Vec<(String, ChangeType)> {
+        changes.iter().map(|c| (c.entity_name.clone(), c.change_type)).collect()
+    }
+
+    fn find_change<'a>(changes: &'a [SemanticChange], name: &str, kind: ChangeType) -> &'a SemanticChange {
+        changes.iter().find(|c| c.entity_name == name && c.change_type == kind)
+            .unwrap_or_else(|| panic!("expected {:?} {} in changes; got: {:?}", kind, name, names(changes)))
     }
 
     #[test]
@@ -456,218 +473,240 @@ mod tests {
         assert_eq!(test.start_line, 4);
     }
 
-    #[test]
-    fn test_nested_key_rename_detected() {
-        // Rename "build" → "compile" inside scripts; value unchanged
-        let before = r#"{
-  "scripts": {
-    "build": "tsc",
-    "test": "jest"
-  }
-}
-"#;
-        let after = r#"{
-  "scripts": {
-    "compile": "tsc",
-    "test": "jest"
-  }
-}
-"#;
-        let changes = json_diff(before, after);
-        let renames: Vec<_> = changes
-            .iter()
-            .filter(|c| c.change_type == ChangeType::Renamed)
-            .collect();
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Top-level scalars
+    // ─────────────────────────────────────────────────────────────────────────
 
-        assert_eq!(renames.len(), 1, "expected exactly one rename");
-        assert_eq!(renames[0].entity_name, "compile");
+    #[test]
+    fn scalar_value_change_reports_modified() {
+        let changes = json_diff(
+            "{\n  \"name\": \"foo\"\n}",
+            "{\n  \"name\": \"bar\"\n}",
+        );
+        assert_eq!(names(&changes), vec![("name".into(), ChangeType::Modified)]);
+        assert_eq!(changes[0].parent_name, None);
     }
 
     #[test]
-    fn test_rename_detected_end_to_end() {
-        let before = "{\n  \"timeout\": 30\n}\n";
-        let after = "{\n  \"request_timeout\": 30\n}\n";
-        let changes = json_diff(before, after);
+    fn scalar_added_to_empty_object_reports_only_the_scalar() {
+        let changes = json_diff("{}", "{\n  \"name\": \"foo\"\n}");
+        assert_eq!(names(&changes), vec![("name".into(), ChangeType::Added)]);
+    }
+
+    #[test]
+    fn scalar_deleted_from_object_reports_only_the_scalar() {
+        let changes = json_diff("{\n  \"name\": \"foo\"\n}", "{}");
+        assert_eq!(names(&changes), vec![("name".into(), ChangeType::Deleted)]);
+    }
+
+    #[test]
+    fn scalar_key_renamed_with_unchanged_value_reports_renamed() {
+        let changes = json_diff(
+            "{\n  \"timeout\": 30\n}",
+            "{\n  \"testTimeout\": 30\n}",
+        );
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].change_type, ChangeType::Renamed);
-        assert_eq!(changes[0].entity_name, "request_timeout");
+        assert_eq!(changes[0].entity_name, "testTimeout");
+        assert_eq!(changes[0].old_entity_name.as_deref(), Some("timeout"));
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Parent suppression — object containers don't surface when children change
+    // ─────────────────────────────────────────────────────────────────────────
+
     #[test]
-    fn test_object_key_rename_detected() {
-        // Rename a top-level object key with identical content → should be Renamed not Deleted+Added
-        // The child "port" did not change its key name, but its parent pointer changed → Moved
-        let before = "{\n  \"config\": {\n    \"port\": 8080\n  }\n}\n";
-        let after = "{\n  \"settings\": {\n    \"port\": 8080\n  }\n}\n";
-        let changes = json_diff(before, after);
-        assert!(
-            changes.iter().any(|c| c.entity_name == "settings" && c.change_type == ChangeType::Renamed),
-            "expected 'settings' to be Renamed, got: {:?}",
-            changes.iter().map(|c| (&c.entity_name, &c.change_type)).collect::<Vec<_>>()
+    fn child_modified_inside_object_only_child_reported() {
+        let changes = json_diff(
+            "{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}",
+            "{\n  \"scripts\": {\n    \"build\": \"webpack\"\n  }\n}",
         );
-        assert!(
-            changes.iter().any(|c| c.entity_name == "port" && c.change_type == ChangeType::Moved),
-            "expected 'port' to be Moved (parent pointer changed due to parent rename), got: {:?}",
-            changes.iter().map(|c| (&c.entity_name, &c.change_type)).collect::<Vec<_>>()
+        assert!(!changes.iter().any(|c| c.entity_name == "scripts"),
+            "scripts should be suppressed; got: {:?}", names(&changes));
+        let build = find_change(&changes, "build", ChangeType::Modified);
+        assert_eq!(build.parent_name.as_deref(), Some("scripts"));
+    }
+
+    #[test]
+    fn child_added_inside_object_only_child_reported() {
+        let changes = json_diff(
+            "{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}",
+            "{\n  \"scripts\": {\n    \"build\": \"tsc\",\n    \"test\": \"jest\"\n  }\n}",
         );
+        assert!(!changes.iter().any(|c| c.entity_name == "scripts" && c.change_type == ChangeType::Modified),
+            "scripts should be suppressed; got: {:?}", names(&changes));
+        let test = find_change(&changes, "test", ChangeType::Added);
+        assert_eq!(test.parent_name.as_deref(), Some("scripts"));
     }
 
     #[test]
-    fn test_scalar_modified() {
-        let before = "{\n  \"name\": \"foo\"\n}";
-        let after  = "{\n  \"name\": \"bar\"\n}";
+    fn child_deleted_inside_object_only_child_reported() {
+        let changes = json_diff(
+            "{\n  \"scripts\": {\n    \"build\": \"tsc\",\n    \"test\": \"jest\"\n  }\n}",
+            "{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}",
+        );
+        assert!(!changes.iter().any(|c| c.entity_name == "scripts" && c.change_type == ChangeType::Modified),
+            "scripts should be suppressed; got: {:?}", names(&changes));
+        let test = find_change(&changes, "test", ChangeType::Deleted);
+        assert_eq!(test.parent_name.as_deref(), Some("scripts"));
+    }
+
+    #[test]
+    fn whole_object_added_only_leaf_children_reported() {
+        let changes = json_diff(
+            "{}",
+            "{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}",
+        );
+        assert!(!changes.iter().any(|c| c.entity_name == "scripts"),
+            "scripts (container) should be suppressed; got: {:?}", names(&changes));
+        let build = find_change(&changes, "build", ChangeType::Added);
+        assert_eq!(build.parent_name.as_deref(), Some("scripts"));
+    }
+
+    #[test]
+    fn whole_object_deleted_only_leaf_children_reported() {
+        let changes = json_diff(
+            "{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}",
+            "{}",
+        );
+        assert!(!changes.iter().any(|c| c.entity_name == "scripts"),
+            "scripts (container) should be suppressed; got: {:?}", names(&changes));
+        find_change(&changes, "build", ChangeType::Deleted);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Deep nesting — full ancestor chain in parent_name
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn deep_nested_value_change_reports_only_the_leaf_with_full_chain() {
+        let before = r#"{
+  "jest": {
+    "config": {
+      "testTimeout": 5000
+    }
+  }
+}"#;
+        let after = r#"{
+  "jest": {
+    "config": {
+      "testTimeout": 10000
+    }
+  }
+}"#;
         let changes = json_diff(before, after);
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].entity_name, "name");
-        assert_eq!(changes[0].change_type, ChangeType::Modified);
+        assert_eq!(names(&changes), vec![("testTimeout".into(), ChangeType::Modified)]);
+        assert_eq!(changes[0].parent_name.as_deref(), Some("jest::config"));
     }
 
-    #[test]
-    fn test_scalar_added() {
-        let before = "{}";
-        let after  = "{\n  \"name\": \"foo\"\n}";
-        let entity_changes: Vec<_> = json_diff(before, after)
-            .into_iter()
-            .filter(|c| c.entity_type != "orphan")
-            .collect();
-        assert_eq!(entity_changes.len(), 1);
-        assert_eq!(entity_changes[0].entity_name, "name");
-        assert_eq!(entity_changes[0].change_type, ChangeType::Added);
-    }
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Renames at the object level
+    // ─────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_scalar_deleted() {
-        let before = "{\n  \"name\": \"foo\"\n}";
-        let after  = "{}";
-        let entity_changes: Vec<_> = json_diff(before, after)
-            .into_iter()
-            .filter(|c| c.entity_type != "orphan")
-            .collect();
-        assert_eq!(entity_changes.len(), 1);
-        assert_eq!(entity_changes[0].entity_name, "name");
-        assert_eq!(entity_changes[0].change_type, ChangeType::Deleted);
-    }
-
-    #[test]
-    fn test_object_added_with_children() {
-        // Adding an object key also adds all its children as individual entities
-        let before = "{}";
-        let after  = "{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}";
-        let changes = json_diff(before, after);
-        let added: Vec<_> = changes.iter().filter(|c| c.change_type == ChangeType::Added).collect();
-        let names: Vec<&str> = added.iter().map(|c| c.entity_name.as_str()).collect();
-        assert!(names.contains(&"scripts"), "scripts should be Added");
-        assert!(names.contains(&"build"), "scripts/build should be Added");
-        assert_eq!(added.len(), 2);
-    }
-
-    #[test]
-    fn test_object_deleted_with_children() {
-        // Deleting an object key also deletes all its children
-        let before = "{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}";
-        let after  = "{}";
-        let changes = json_diff(before, after);
-        let deleted: Vec<_> = changes.iter().filter(|c| c.change_type == ChangeType::Deleted).collect();
-        let names: Vec<&str> = deleted.iter().map(|c| c.entity_name.as_str()).collect();
-        assert!(names.contains(&"scripts"), "scripts should be Deleted");
-        assert!(names.contains(&"build"), "scripts/build should be Deleted");
-        assert_eq!(deleted.len(), 2);
-    }
-
-    #[test]
-    fn test_nested_key_added() {
-        let before = "{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}";
-        let after  = "{\n  \"scripts\": {\n    \"build\": \"tsc\",\n    \"test\": \"jest\"\n  }\n}";
-        let changes = json_diff(before, after);
-        assert!(changes.iter().any(|c| c.entity_name == "scripts" && c.change_type == ChangeType::Modified));
-        assert!(changes.iter().any(|c| c.entity_name == "test" && c.change_type == ChangeType::Added));
-    }
-
-    #[test]
-    fn test_nested_key_deleted() {
-        let before = "{\n  \"scripts\": {\n    \"build\": \"tsc\",\n    \"test\": \"jest\"\n  }\n}";
-        let after  = "{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}";
-        let changes = json_diff(before, after);
-        assert!(changes.iter().any(|c| c.entity_name == "scripts" && c.change_type == ChangeType::Modified));
-        assert!(changes.iter().any(|c| c.entity_name == "test" && c.change_type == ChangeType::Deleted));
-    }
-
-    #[test]
-    fn test_array_key_renamed() {
-        // Renaming an array-valued key (not its elements) should be detected as Renamed
-        let before = "{\n  \"deps\": [\"react\", \"vue\"]\n}";
-        let after  = "{\n  \"dependencies\": [\"react\", \"vue\"]\n}";
+    fn nested_scalar_rename_with_unchanged_value() {
+        // Same value → structural_hash matches → Renamed.
+        let before = r#"{
+  "scripts": {
+    "run": "node .",
+    "test": "jest"
+  }
+}"#;
+        let after = r#"{
+  "scripts": {
+    "start": "node .",
+    "test": "jest"
+  }
+}"#;
         let changes = json_diff(before, after);
         let renames: Vec<_> = changes.iter().filter(|c| c.change_type == ChangeType::Renamed).collect();
         assert_eq!(renames.len(), 1);
-        assert_eq!(renames[0].entity_name, "dependencies");
+        assert_eq!(renames[0].entity_name, "start");
+        assert_eq!(renames[0].old_entity_name.as_deref(), Some("run"));
+        assert_eq!(renames[0].parent_name.as_deref(), Some("scripts"));
     }
 
     #[test]
-    fn test_deep_nesting_three_levels() {
-        // Modifying a value at 3 levels deep should report all ancestors as Modified
-        let before = r#"{
-  "jest": {
-    "config": {
-      "timeout": 5000
-    }
-  }
-}"#;
-        let after = r#"{
-  "jest": {
-    "config": {
-      "timeout": 10000
-    }
-  }
-}"#;
+    fn parent_object_renamed_unchanged_child_move_suppressed() {
+        // scripts → tasks, dev unchanged: only the parent rename is reported.
+        let before = "{\n  \"scripts\": {\n    \"dev\": \"vite\"\n  }\n}\n";
+        let after = "{\n  \"tasks\": {\n    \"dev\": \"vite\"\n  }\n}\n";
         let changes = json_diff(before, after);
-        assert!(changes.iter().any(|c| c.entity_name == "jest"    && c.change_type == ChangeType::Modified));
-        assert!(changes.iter().any(|c| c.entity_name == "config"  && c.change_type == ChangeType::Modified));
-        assert!(changes.iter().any(|c| c.entity_name == "timeout" && c.change_type == ChangeType::Modified));
-        assert_eq!(changes.len(), 3);
+        let tasks = find_change(&changes, "tasks", ChangeType::Renamed);
+        assert_eq!(tasks.old_entity_name.as_deref(), Some("scripts"));
+        assert!(!changes.iter().any(|c| c.entity_name == "dev"),
+            "child 'dev' should be suppressed (only moved due to parent rename); got: {:?}", names(&changes));
     }
 
-    /// Known limitation: when a parent is renamed AND its content changes in the same
-    /// commit the parent rename cannot be detected — it shows as Deleted + Added.
-    /// See spec: "Known limitations — Parent rename + content change in the same commit".
     #[test]
-    fn test_parent_rename_with_content_change_not_detected() {
-        let before = r#"{
-  "config": {
-    "port": 8080
-  }
-}"#;
-        let after = r#"{
-  "settings": {
-    "port": 8080,
-    "host": "localhost"
-  }
-}"#;
+    fn parent_object_renamed_and_child_renamed_only_child_surfaces() {
+        // scripts → tasks AND dev → develop. Parent rename cannot be detected
+        // because the renamed child key changes the parent's structural_hash.
+        // The child move alone conveys the move + rename via:
+        //   parent_name="tasks", old_entity_name="dev", old_parent_id=<scripts>
+        let before = "{\n  \"scripts\": {\n    \"dev\": \"vite\"\n  }\n}\n";
+        let after = "{\n  \"tasks\": {\n    \"develop\": \"vite\"\n  }\n}\n";
         let changes = json_diff(before, after);
-        assert!(
-            changes.iter().any(|c| c.entity_name == "config" && c.change_type == ChangeType::Deleted),
-            "config should be Deleted (rename undetectable when content also changed)"
-        );
-        assert!(
-            changes.iter().any(|c| c.entity_name == "settings" && c.change_type == ChangeType::Added),
-            "settings should be Added (rename undetectable when content also changed)"
-        );
-        assert!(
-            !changes.iter().any(|c| c.entity_name == "settings" && c.change_type == ChangeType::Renamed),
-            "settings should NOT appear as Renamed — this is a known limitation"
-        );
+        assert_eq!(names(&changes), vec![("develop".into(), ChangeType::Moved)]);
+        let develop = &changes[0];
+        assert_eq!(develop.old_entity_name.as_deref(), Some("dev"));
+        assert_eq!(develop.parent_name.as_deref(), Some("tasks"));
+        assert!(develop.old_parent_id.is_some(), "child Moved should carry old_parent_id");
     }
 
-    // --- Bug regression tests (these fail until the bugs are fixed) ---
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Type transitions — scalar ↔ object
+    // ─────────────────────────────────────────────────────────────────────────
 
-    /// BUG: Renaming a key inside an array element produces a spurious Renamed event.
-    /// Array element keys have no stable identity and should never be tracked as entities.
-    /// `find_top_level_entries` treats `[` the same as `{`, so the parser recurses into
-    /// the first array element and creates a ghost entity with empty content.
-    /// Because the ghost entity always has content_hash=hash(""), Phase 2 matches any
-    /// two ghost entities with different key names as a Renamed change.
     #[test]
-    fn test_array_element_key_rename_not_tracked() {
+    fn scalar_to_object_transition_reports_modified_plus_new_children_added() {
+        let changes = json_diff(
+            "{\n  \"build\": \"tsc\"\n}",
+            "{\n  \"build\": {\n    \"command\": \"tsc\"\n  }\n}",
+        );
+        let build = find_change(&changes, "build", ChangeType::Modified);
+        assert_eq!(build.entity_type, "object", "after type should reflect new value");
+        let command = find_change(&changes, "command", ChangeType::Added);
+        assert_eq!(command.parent_name.as_deref(), Some("build"));
+    }
+
+    #[test]
+    fn object_to_scalar_transition_reports_modified_plus_old_children_deleted() {
+        let changes = json_diff(
+            "{\n  \"config\": {\n    \"watch\": true\n  }\n}",
+            "{\n  \"config\": \"auto\"\n}",
+        );
+        let config = find_change(&changes, "config", ChangeType::Modified);
+        assert_eq!(config.entity_type, "property", "after type should reflect new value");
+        find_change(&changes, "watch", ChangeType::Deleted);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Arrays — opaque (no recursion into elements)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn array_modified_reports_only_the_array_key() {
+        let changes = json_diff(
+            "{\n  \"deps\": [\"react\", \"vue\"]\n}",
+            "{\n  \"deps\": [\"react\", \"vue\", \"lodash\"]\n}",
+        );
+        assert_eq!(names(&changes), vec![("deps".into(), ChangeType::Modified)]);
+    }
+
+    #[test]
+    fn array_renamed_when_contents_unchanged() {
+        let changes = json_diff(
+            "{\n  \"deps\": [\"react\", \"vue\"]\n}",
+            "{\n  \"dependencies\": [\"react\", \"vue\"]\n}",
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].change_type, ChangeType::Renamed);
+        assert_eq!(changes[0].entity_name, "dependencies");
+    }
+
+    #[test]
+    fn array_element_keys_are_not_tracked_as_entities() {
         let before = r#"{
   "deps": [
     {"name": "react"},
@@ -681,63 +720,84 @@ mod tests {
   ]
 }"#;
         let changes = json_diff(before, after);
-        let renames: Vec<_> = changes.iter().filter(|c| c.change_type == ChangeType::Renamed).collect();
-        assert!(
-            renames.is_empty(),
-            "array element keys should not produce rename events, got: {:?}",
-            renames.iter().map(|c| c.entity_name.as_str()).collect::<Vec<_>>()
+        assert_eq!(names(&changes), vec![("deps".into(), ChangeType::Modified)],
+            "array elements have no stable identity; only the array key should change");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Null and empty values
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn null_to_string_value_reports_modified() {
+        let changes = json_diff(
+            "{\n  \"key\": null\n}",
+            "{\n  \"key\": \"value\"\n}",
         );
-        // Only deps itself should be reported as modified
+        assert_eq!(names(&changes), vec![("key".into(), ChangeType::Modified)]);
+    }
+
+    #[test]
+    fn empty_object_gains_child_only_child_reported() {
+        let changes = json_diff(
+            "{\n  \"key\": {}\n}",
+            "{\n  \"key\": {\n    \"build\": \"tsc\"\n  }\n}",
+        );
+        assert!(!changes.iter().any(|c| c.entity_name == "key"),
+            "empty-to-non-empty parent should be suppressed; got: {:?}", names(&changes));
+        let build = find_change(&changes, "build", ChangeType::Added);
+        assert_eq!(build.parent_name.as_deref(), Some("key"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Entity ID format — file::pointer (no entity_type)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn entity_id_for_nested_property_uses_full_pointer_only() {
+        let changes = json_diff(
+            "{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}",
+            "{\n  \"scripts\": {\n    \"build\": \"webpack\"\n  }\n}",
+        );
+        let build = find_change(&changes, "build", ChangeType::Modified);
+        assert_eq!(build.entity_id, "test.json::/scripts/build");
+    }
+
+    #[test]
+    fn key_with_slash_is_pointer_escaped_in_entity_id() {
+        let changes = json_diff(
+            "{\n  \"a/b\": 1\n}",
+            "{\n  \"a/b\": 2\n}",
+        );
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].entity_name, "deps");
-        assert_eq!(changes[0].change_type, ChangeType::Modified);
+        assert_eq!(changes[0].entity_id, "test.json::/a~1b");
     }
 
-    /// BUG: The entity_id for nested entities in diff output is redundant.
-    /// `build_entity_id` with a parent_id formats as `{file}::{parent_id}::{pointer}`,
-    /// embedding the full parent ID so the file path and parent pointer both repeat.
-    /// Expected entity_id: `"test.json::property::/scripts/build"`
-    /// Actual entity_id:   `"test.json::test.json::object::/scripts::/scripts/build"`
     #[test]
-    fn test_nested_entity_id_in_diff_output() {
-        let before = r#"{
-  "scripts": {
-    "build": "tsc"
-  }
-}"#;
-        let after = r#"{
-  "scripts": {
-    "build": "webpack"
-  }
-}"#;
-        let changes = json_diff(before, after);
-        let build_change = changes.iter().find(|c| c.entity_name == "build")
-            .expect("expected a change for the build entity");
-        assert_eq!(
-            build_change.entity_id,
-            "test.json::property::/scripts/build",
-            "nested entity_id in diff output should be a clean non-redundant path; actual: {:?}",
-            build_change.entity_id
+    fn key_with_tilde_is_pointer_escaped_in_entity_id() {
+        let changes = json_diff(
+            "{\n  \"a~b\": 1\n}",
+            "{\n  \"a~b\": 2\n}",
         );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].entity_id, "test.json::/a~0b");
     }
 
-    // --- End bug regression tests ---
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Phase 3 fuzzy matching
+    // ─────────────────────────────────────────────────────────────────────────
 
-    /// Phase 3 (fuzzy similarity) catches a rename when the key is renamed AND
-    /// the value changes slightly — so structural_hash differs and Phase 2 misses it.
-    /// The object has enough shared tokens that Jaccard similarity > 0.8 threshold.
     #[test]
-    fn test_fuzzy_rename_detected_via_phase_3() {
-        // "config" → "settings": key renamed (Phase 1 & 2 both miss it)
-        // "timeout": 30 → 60: value changed (rules out Phase 2 on the parent)
-        // 9 other fields unchanged: enough shared tokens for Jaccard > 0.8 (Phase 3 catches it)
+    fn fuzzy_rename_detected_when_value_mostly_unchanged() {
+        // config → settings: key rename (Phase 1 & 2 miss).
+        // testTimeout 30 → 60: small value change rules out structural_hash.
+        // Many siblings unchanged → Jaccard > 0.8 → Phase 3 catches it.
         let before = r#"{
   "config": {
-    "port": 8080,
     "host": "localhost",
     "protocol": "https",
     "retries": 3,
-    "timeout": 30,
+    "testTimeout": 30,
     "keepalive": true,
     "compression": true,
     "logging": "verbose",
@@ -746,11 +806,10 @@ mod tests {
 }"#;
         let after = r#"{
   "settings": {
-    "port": 8080,
     "host": "localhost",
     "protocol": "https",
     "retries": 3,
-    "timeout": 60,
+    "testTimeout": 60,
     "keepalive": true,
     "compression": true,
     "logging": "verbose",
@@ -758,107 +817,49 @@ mod tests {
   }
 }"#;
         let changes = json_diff(before, after);
-        let renames: Vec<_> = changes.iter().filter(|c| c.change_type == ChangeType::Renamed).collect();
-        let settings_rename = renames.iter().find(|c| c.entity_name == "settings");
-        assert!(
-            settings_rename.is_some(),
-            "expected 'settings' to be detected as Renamed via fuzzy similarity; changes: {:?}",
-            changes.iter().map(|c| (&c.entity_name, &c.change_type)).collect::<Vec<_>>()
-        );
+        assert!(changes.iter().any(|c| c.entity_name == "settings" && c.change_type == ChangeType::Renamed),
+            "expected fuzzy rename of config → settings; got: {:?}", names(&changes));
     }
 
-    #[test]
-    fn test_key_with_slash_is_pointer_escaped() {
-        // A key containing "/" must be escaped to "~1" in the JSON Pointer.
-        // Wrong escaping would produce a different entity ID on each side → spurious Deleted+Added
-        // instead of Modified, silently breaking rename detection.
-        let before = "{\n  \"a/b\": 1\n}";
-        let after  = "{\n  \"a/b\": 2\n}";
-        let changes = json_diff(before, after);
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].change_type, ChangeType::Modified);
-        assert_eq!(changes[0].entity_id, "test.json::property::/a~1b");
-    }
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Known limitations (documented in spec)
+    // ─────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_key_with_tilde_is_pointer_escaped() {
-        // A key containing "~" must be escaped to "~0" in the JSON Pointer.
-        // The escaping order matters: "~" → "~0" must happen before "/" → "~1",
-        // otherwise a slash would become "~1" and then the "~" in that would become "~01".
-        let before = "{\n  \"a~b\": 1\n}";
-        let after  = "{\n  \"a~b\": 2\n}";
-        let changes = json_diff(before, after);
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].change_type, ChangeType::Modified);
-        assert_eq!(changes[0].entity_id, "test.json::property::/a~0b");
-    }
-
-    #[test]
-    fn test_object_child_modified_reports_parent_and_child() {
-        // Changing a child value reports BOTH the parent object AND the child as Modified
-        // (double-reporting is intentional — the parent's content genuinely changed)
+    fn parent_rename_with_sibling_added_surfaces_leaf_moves() {
+        // Parent renamed AND a new sibling appears: structural_hash diverges,
+        // Phase 2 misses the parent rename. The unchanged child still matches
+        // by structural_hash and surfaces as Moved; the parent Deleted/Added
+        // entries are container-suppressed.
         let before = r#"{
   "scripts": {
     "build": "tsc"
   }
 }"#;
         let after = r#"{
-  "scripts": {
-    "build": "webpack"
+  "tasks": {
+    "build": "tsc",
+    "test": "jest"
   }
 }"#;
         let changes = json_diff(before, after);
-        assert!(
-            changes.iter().any(|c| c.entity_name == "scripts" && c.change_type == ChangeType::Modified),
-            "parent 'scripts' should be Modified"
-        );
-        assert!(
-            changes.iter().any(|c| c.entity_name == "build" && c.change_type == ChangeType::Modified),
-            "child 'build' should be Modified"
-        );
-        assert_eq!(changes.len(), 2);
+        let build = find_change(&changes, "build", ChangeType::Moved);
+        assert_eq!(build.parent_name.as_deref(), Some("tasks"));
+        assert!(build.old_parent_id.is_some());
+        find_change(&changes, "test", ChangeType::Added);
+        assert!(!changes.iter().any(|c| c.entity_name == "scripts" || c.entity_name == "tasks"),
+            "parent Deleted/Added should be suppressed; got: {:?}", names(&changes));
     }
 
     #[test]
-    fn test_array_scalar_elements_modified_is_opaque() {
-        // Adding an element to an array reports the array key as Modified — no child entities
-        let before = r#"{
-  "deps": ["react", "vue"]
-}"#;
-        let after = r#"{
-  "deps": ["react", "vue", "lodash"]
-}"#;
-        let changes = json_diff(before, after);
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].entity_name, "deps");
-        assert_eq!(changes[0].change_type, ChangeType::Modified);
-    }
-
-    #[test]
-    fn test_null_value_modified() {
-        let before = "{\n  \"key\": null\n}";
-        let after  = "{\n  \"key\": \"value\"\n}";
-        let changes = json_diff(before, after);
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].entity_name, "key");
-        assert_eq!(changes[0].change_type, ChangeType::Modified);
-    }
-
-    #[test]
-    fn test_empty_nested_object_gains_child() {
-        // {} → {port: 8080}: parent is Modified, new child is Added
-        let before = "{\n  \"key\": {}\n}";
-        let after  = "{\n  \"key\": {\n    \"port\": 8080\n  }\n}";
-        let changes = json_diff(before, after);
-        assert!(
-            changes.iter().any(|c| c.entity_name == "key" && c.change_type == ChangeType::Modified),
-            "'key' should be Modified"
+    fn parent_rename_with_child_value_change_falls_back_to_leaf_delete_add() {
+        let changes = json_diff(
+            "{\n  \"scripts\": {\n    \"dev\": \"vite\"\n  }\n}\n",
+            "{\n  \"tasks\": {\n    \"dev\": \"rollup\"\n  }\n}\n",
         );
-        assert!(
-            changes.iter().any(|c| c.entity_name == "port" && c.change_type == ChangeType::Added),
-            "'key/port' should be Added"
-        );
-        assert_eq!(changes.len(), 2);
+        find_change(&changes, "dev", ChangeType::Deleted);
+        find_change(&changes, "dev", ChangeType::Added);
+        assert!(!changes.iter().any(|c| c.change_type == ChangeType::Renamed),
+            "rename should not be detectable; got: {:?}", names(&changes));
     }
-
 }
