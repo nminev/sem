@@ -11,6 +11,8 @@ pub fn format_json(result: &DiffResult) -> String {
                 "changeType": c.change_type,
                 "entityType": c.entity_type,
                 "entityName": c.entity_name,
+                "entityLine": c.entity_line,
+                "parentName": c.parent_name,
                 "oldEntityName": c.old_entity_name,
                 "filePath": c.file_path,
                 "oldFilePath": c.old_file_path,
