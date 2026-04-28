@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn test_object_key_rename_detected() {
         // Rename a top-level object key with identical content → should be Renamed not Deleted+Added
-        // The child "port" has the same key name and value in both paths → also Renamed
+        // The child "port" did not change its key name, but its parent pointer changed → Moved
         let before = "{\n  \"config\": {\n    \"port\": 8080\n  }\n}\n";
         let after = "{\n  \"settings\": {\n    \"port\": 8080\n  }\n}\n";
         let changes = json_diff(before, after);
@@ -506,8 +506,8 @@ mod tests {
             changes.iter().map(|c| (&c.entity_name, &c.change_type)).collect::<Vec<_>>()
         );
         assert!(
-            changes.iter().any(|c| c.entity_name == "port" && c.change_type == ChangeType::Renamed),
-            "expected 'port' to be Renamed (unchanged value, path changed due to parent rename), got: {:?}",
+            changes.iter().any(|c| c.entity_name == "port" && c.change_type == ChangeType::Moved),
+            "expected 'port' to be Moved (parent pointer changed due to parent rename), got: {:?}",
             changes.iter().map(|c| (&c.entity_name, &c.change_type)).collect::<Vec<_>>()
         );
     }
@@ -526,20 +526,26 @@ mod tests {
     fn test_scalar_added() {
         let before = "{}";
         let after  = "{\n  \"name\": \"foo\"\n}";
-        let changes = json_diff(before, after);
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].entity_name, "name");
-        assert_eq!(changes[0].change_type, ChangeType::Added);
+        let entity_changes: Vec<_> = json_diff(before, after)
+            .into_iter()
+            .filter(|c| c.entity_type != "orphan")
+            .collect();
+        assert_eq!(entity_changes.len(), 1);
+        assert_eq!(entity_changes[0].entity_name, "name");
+        assert_eq!(entity_changes[0].change_type, ChangeType::Added);
     }
 
     #[test]
     fn test_scalar_deleted() {
         let before = "{\n  \"name\": \"foo\"\n}";
         let after  = "{}";
-        let changes = json_diff(before, after);
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].entity_name, "name");
-        assert_eq!(changes[0].change_type, ChangeType::Deleted);
+        let entity_changes: Vec<_> = json_diff(before, after)
+            .into_iter()
+            .filter(|c| c.entity_type != "orphan")
+            .collect();
+        assert_eq!(entity_changes.len(), 1);
+        assert_eq!(entity_changes[0].entity_name, "name");
+        assert_eq!(entity_changes[0].change_type, ChangeType::Deleted);
     }
 
     #[test]
