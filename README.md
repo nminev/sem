@@ -1,3 +1,5 @@
+> **Fork notice:** This is a fork of [Ataraxy-Labs/sem](https://github.com/Ataraxy-Labs/sem). The fork carries two stable additions for code diffs — full ancestor chain in `parent_name` and parent suppression for nested entities — and an active line of JSON-diff improvements (recursive entity extraction, type-transition handling, full-chain display). See `JSON_SEMANTIC_DIFF_SPEC.md` for the JSON behavior. To use this fork's behavior, build from source: `cargo build --release -p sem-cli` from `crates/`.
+
 > **Part of the [Ataraxy Labs](https://ataraxy-labs.com) stack** — agent-native infrastructure for software development. See also: [weave](https://ataraxy-labs.com/weave) (entity-level git merge driver) · [inspect](https://github.com/Ataraxy-Labs/inspect) (semantic code review) · [opensessions](https://github.com/Ataraxy-Labs/opensessions) (tmux sidebar for coding agents).
 >
 > Read the manifesto: https://ataraxy-labs.com/#thesis · Essays: https://ataraxy-labs.com/blogs · LLMs: https://ataraxy-labs.com/llms.txt
