@@ -9,7 +9,7 @@ use sem_core::git::types::{DiffScope, FileChange};
 use sem_core::parser::differ::compute_semantic_diff;
 use sem_core::parser::plugins::create_default_registry;
 
-use crate::formatters::{json::format_json, markdown::format_markdown, plain::format_plain, terminal::format_terminal};
+use crate::formatters::{json::format_json, markdown::format_markdown, nice::format_nice, plain::format_plain, terminal::format_terminal};
 
 pub struct DiffOptions {
     pub cwd: String,
@@ -33,6 +33,7 @@ pub enum OutputFormat {
     Json,
     #[value(alias = "md")]
     Markdown,
+    Nice,
 }
 
 /// Parsed result of git-diff-style positional arguments
@@ -483,6 +484,7 @@ fn run_diff_pipeline(
     let output = match opts.format {
         OutputFormat::Json => format_json(&result),
         OutputFormat::Markdown => format_markdown(&result, opts.verbose),
+        OutputFormat::Nice => format_nice(&result),
         OutputFormat::Plain => format_plain(&result),
         OutputFormat::Terminal => format_terminal(&result, opts.verbose),
     };

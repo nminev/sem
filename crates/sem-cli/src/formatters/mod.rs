@@ -1,4 +1,5 @@
 pub mod terminal;
 pub mod json;
 pub mod markdown;
+pub mod nice;
 pub mod plain;
