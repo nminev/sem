@@ -599,6 +599,35 @@ mod tests {
         assert_eq!(changes[0].parent_name.as_deref(), Some("jest::config"));
     }
 
+    #[test]
+    fn empty_string_key_ancestor_is_skipped_in_parent_name() {
+        // package-lock.json uses "" as a key for the root project.
+        // Walking the parent chain for a deeply-nested change must not emit
+        // the empty name (would render as "::::") in the displayed path.
+        let before = r#"{
+  "packages": {
+    "": {
+      "dependencies": {
+        "jose": "^6.1.3"
+      }
+    }
+  }
+}"#;
+        let after = r#"{
+  "packages": {
+    "": {
+      "dependencies": {
+        "jose": "^6.1.4"
+      }
+    }
+  }
+}"#;
+        let changes = json_diff(before, after);
+        let jose = find_change(&changes, "jose", ChangeType::Modified);
+        // The empty-string key ancestor is dropped from the displayed chain.
+        assert_eq!(jose.parent_name.as_deref(), Some("packages::dependencies"));
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     //  Renames at the object level
     // ─────────────────────────────────────────────────────────────────────────

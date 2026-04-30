@@ -12,7 +12,13 @@ fn parent_name(
     loop {
         match by_id.get(pid) {
             Some(parent) => {
-                parts.push(parent.name.as_str());
+                // Skip ancestors with empty names (e.g. JSON's empty-string
+                // root-package key in package-lock.json). The full path is
+                // still recoverable from entity_id; the displayed chain is
+                // for human readability.
+                if !parent.name.is_empty() {
+                    parts.push(parent.name.as_str());
+                }
                 match parent.parent_id.as_deref() {
                     Some(next) => pid = next,
                     None => break,
