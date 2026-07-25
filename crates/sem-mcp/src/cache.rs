@@ -1,37 +1,934 @@
 use std::collections::{HashMap, HashSet};
+use std::env;
+use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use sem_core::git::bridge::GitBridge;
+use sem_core::git::types::{CommitInfo, DiffScope};
 use sem_core::model::entity::SemanticEntity;
-use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityRef, RefType};
+use sem_core::parser::differ::compute_semantic_diff;
+use sem_core::parser::graph::{EntityGraph, EntityInfo, EntityInfoMap, EntityRef, RefType};
+use sem_core::parser::hotspot::{
+    aggregate_history_analytics, CommitEntityChanges, HistoryAnalytics,
+};
+use sem_core::parser::js_ts_import_source_files_from_content;
+use sem_core::parser::registry::ParserRegistry;
+use sem_core::utils::hash::content_hash_bytes;
+
+pub const CACHE_SCHEMA_VERSION: i32 = 9;
+pub const CACHE_KIND_FULL: &str = "full";
+pub const CACHE_KIND_TOPOLOGY: &str = "topology";
+pub const CACHE_INDEXES: &[(&str, &str, &str)] = &[
+    ("idx_entities_file_path", "entities", "file_path"),
+    ("idx_entities_name", "entities", "name"),
+    ("idx_entities_name_file_path", "entities", "name, file_path"),
+    (
+        "idx_entities_type_name_file_path",
+        "entities",
+        "entity_type, name, file_path",
+    ),
+    ("idx_entities_parent_id", "entities", "parent_id"),
+    ("idx_entities_parent_id_name", "entities", "parent_id, name"),
+    ("idx_edges_from_entity", "edges", "from_entity"),
+    (
+        "idx_edges_from_to_ref",
+        "edges",
+        "from_entity, to_entity, ref_type",
+    ),
+    ("idx_edges_to_entity", "edges", "to_entity"),
+    (
+        "idx_edges_to_from_ref",
+        "edges",
+        "to_entity, from_entity, ref_type",
+    ),
+    (
+        "idx_file_imports_imported_file",
+        "file_imports",
+        "imported_file",
+    ),
+    (
+        "idx_file_imports_importing_file",
+        "file_imports",
+        "importing_file",
+    ),
+    (
+        "idx_entity_changes_commit_sha",
+        "entity_changes",
+        "commit_sha",
+    ),
+    (
+        "idx_entity_changes_entity_name",
+        "entity_changes",
+        "entity_name",
+    ),
+];
+
+// Cache-only keys use a NUL prefix so they cannot collide with git paths.
+pub const CACHE_MANIFEST_FILES: &[(&str, &str)] = &[
+    (".semrc", "\0sem-manifest:.semrc"),
+    (".gitattributes", "\0sem-manifest:.gitattributes"),
+    (".semignore", "\0sem-manifest:.semignore"),
+];
+pub const CACHE_SOURCE_SCOPE_KEY: &str = "source_scope";
+pub const CACHE_SOURCE_SCOPE_DEFAULT: &str = "default";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CacheSourceScope {
+    Default,
+    Custom,
+}
+
+const CACHE_SCHEMA_SQL: &str = "
+CREATE TABLE IF NOT EXISTS files (
+    path TEXT PRIMARY KEY,
+    mtime_secs INTEGER NOT NULL,
+    mtime_nanos INTEGER NOT NULL,
+    content_hash TEXT
+);
+CREATE TABLE IF NOT EXISTS entities (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    start_line INTEGER NOT NULL,
+    end_line INTEGER NOT NULL,
+    start_byte INTEGER,
+    end_byte INTEGER,
+    content TEXT,
+    content_hash TEXT NOT NULL,
+    structural_hash TEXT,
+    parent_id TEXT,
+    metadata_json TEXT
+);
+CREATE TABLE IF NOT EXISTS edges (
+    from_entity TEXT NOT NULL,
+    to_entity TEXT NOT NULL,
+    ref_type TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS file_imports (
+    importing_file TEXT NOT NULL,
+    imported_file TEXT NOT NULL,
+    PRIMARY KEY (importing_file, imported_file)
+);
+CREATE TABLE IF NOT EXISTS file_contents (
+    path TEXT PRIMARY KEY,
+    ztext BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cache_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS entity_flags (
+    entity_id TEXT PRIMARY KEY,
+    is_test INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS commits (
+    sha TEXT PRIMARY KEY,
+    short_sha TEXT NOT NULL,
+    author TEXT NOT NULL,
+    committed_at INTEGER NOT NULL,
+    message TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS entity_changes (
+    commit_sha TEXT NOT NULL,
+    entity_name TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    change_type TEXT NOT NULL,
+    old_entity_name TEXT,
+    old_file_path TEXT,
+    structural INTEGER
+);
+";
+
+const CACHE_RESET_SQL: &str = "
+DROP TABLE IF EXISTS files;
+DROP TABLE IF EXISTS entities;
+DROP TABLE IF EXISTS edges;
+DROP TABLE IF EXISTS file_imports;
+DROP TABLE IF EXISTS file_contents;
+DROP TABLE IF EXISTS cache_metadata;
+DROP TABLE IF EXISTS entity_flags;
+DROP TABLE IF EXISTS commits;
+DROP TABLE IF EXISTS entity_changes;
+";
+
+/// Per-connection performance pragmas. These are not persisted in the database
+/// file, so they must be re-applied on every connection open (including
+/// read-only opens). `mmap_size` serves reads via memory-mapped I/O, a larger
+/// `cache_size` keeps more pages hot, and `temp_store=MEMORY` keeps temporary
+/// b-trees off disk. This speeds the topology load on large repos.
+pub fn apply_performance_pragmas(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "PRAGMA mmap_size=268435456;
+         PRAGMA cache_size=-65536;
+         PRAGMA temp_store=MEMORY;",
+    )
+}
+
+/// Entity bodies are not duplicated into the cache when they can be proven
+/// recoverable: the file's text is stored once (zstd) in `file_contents`, and
+/// any entity whose `content` equals `file_text[start_byte..end_byte]`
+/// byte-for-byte stores NULL content and is re-sliced on load. Entities that
+/// fail the proof (no spans, normalized line endings, disk changed since
+/// extraction) keep their content inline — identity by construction, never by
+/// assumption. On a 139K-entity corpus this removes the ~2x source duplication
+/// nested entities cause (#322).
+pub fn compress_file_text(text: &str) -> Option<Vec<u8>> {
+    zstd::encode_all(text.as_bytes(), 3).ok()
+}
+
+pub fn decompress_file_text(blob: &[u8]) -> Option<String> {
+    zstd::decode_all(blob)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+}
+
+/// Insert entities using the content store. `replace` selects INSERT OR
+/// REPLACE (incremental saves) vs plain INSERT (full saves). Reads each
+/// referenced file from disk at most once, verifies every span slice against
+/// the entity's content, and stores the compressed file text only when at
+/// least one entity in it proved sliceable.
+pub fn insert_entities_with_content_store(
+    tx: &Transaction<'_>,
+    root: &Path,
+    entities: &[&SemanticEntity],
+    replace: bool,
+) -> Result<(), rusqlite::Error> {
+    let verb = if replace {
+        "INSERT OR REPLACE INTO"
+    } else {
+        "INSERT INTO"
+    };
+    let sql = format!(
+        "{verb} entities (id, name, entity_type, file_path, start_line, end_line, start_byte, end_byte, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+    );
+    let mut stmt = tx.prepare(&sql)?;
+    let mut file_texts: HashMap<&str, Option<String>> = HashMap::new();
+    let mut files_to_store: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    for e in entities {
+        let metadata_json = e
+            .metadata
+            .as_ref()
+            .and_then(|m| serde_json::to_string(m).ok());
+        let text = file_texts
+            .entry(e.file_path.as_str())
+            .or_insert_with(|| std::fs::read_to_string(root.join(&e.file_path)).ok());
+        let sliceable = match (text.as_deref(), e.start_byte, e.end_byte) {
+            (Some(t), Some(sb), Some(eb)) => t.get(sb..eb) == Some(e.content.as_str()),
+            _ => false,
+        };
+        let stored_content: Option<&str> = if sliceable {
+            files_to_store.insert(e.file_path.as_str());
+            None
+        } else {
+            Some(e.content.as_str())
+        };
+        stmt.execute(params![
+            e.id,
+            e.name,
+            e.entity_type,
+            e.file_path,
+            e.start_line as i64,
+            e.end_line as i64,
+            e.start_byte.map(|v| v as i64),
+            e.end_byte.map(|v| v as i64),
+            stored_content,
+            e.content_hash,
+            e.structural_hash,
+            e.parent_id,
+            metadata_json,
+        ])?;
+    }
+
+    let mut fc =
+        tx.prepare("INSERT OR REPLACE INTO file_contents (path, ztext) VALUES (?1, ?2)")?;
+    for path in files_to_store {
+        if let Some(Some(text)) = file_texts.get(path) {
+            if let Some(blob) = compress_file_text(text) {
+                fc.execute(params![path, blob])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Load-side counterpart: resolves an entity's content from the inline column
+/// or by slicing the stored file text. Decompresses each file at most once.
+pub struct ContentReconstructor<'c> {
+    conn: &'c Connection,
+    cache: HashMap<String, Option<String>>,
+}
+
+impl<'c> ContentReconstructor<'c> {
+    pub fn new(conn: &'c Connection) -> Self {
+        Self {
+            conn,
+            cache: HashMap::new(),
+        }
+    }
+
+    pub fn content(
+        &mut self,
+        file_path: &str,
+        inline: Option<String>,
+        start_byte: Option<usize>,
+        end_byte: Option<usize>,
+    ) -> String {
+        if let Some(c) = inline {
+            return c;
+        }
+        let conn = self.conn;
+        let text = self.cache.entry(file_path.to_string()).or_insert_with(|| {
+            conn.query_row(
+                "SELECT ztext FROM file_contents WHERE path = ?1",
+                params![file_path],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .ok()
+            .and_then(|blob| decompress_file_text(&blob))
+        });
+        match (text.as_deref(), start_byte, end_byte) {
+            (Some(t), Some(sb), Some(eb)) => t.get(sb..eb).unwrap_or("").to_string(),
+            _ => String::new(),
+        }
+    }
+}
+
+// ── Semantic commit index (storage engine layer 2) ──
+//
+// History stored as entity deltas: each commit is semantic-diffed against its
+// FIRST PARENT exactly once and persisted as entity-change rows keyed by sha.
+// Every later history query is a lookup plus a diff of only the commits git
+// gained since. Rows are branch-agnostic (sha-keyed), so switching branches
+// never invalidates the index. Merge commits are recorded with no changes:
+// their first-parent diff restates the merged-in commits, which are indexed
+// individually on their own shas.
+
+/// Answer repo history analytics from the semantic commit index, indexing any
+/// commits it has not seen. Returns None when the cache is unusable so callers
+/// can fall back to the live git walk.
+pub fn history_analytics_from_store(
+    repo_root: &Path,
+    git: &GitBridge,
+    registry: &ParserRegistry,
+    file_path: Option<&str>,
+    max_commits: usize,
+) -> Option<HistoryAnalytics> {
+    let commits = git.get_log(max_commits.saturating_add(1)).ok()?;
+    if commits.len() < 2 {
+        return Some(aggregate_history_analytics(&[], file_path));
+    }
+    let mut cache = DiskCache::open(repo_root).ok()?;
+    // The oldest walked commit is the diff baseline only, mirroring the
+    // windows(2) accounting of the live walk.
+    let scan = &commits[..commits.len() - 1];
+    cache.index_commits(git, registry, scan).ok()?;
+    let mut scanned = Vec::with_capacity(scan.len());
+    for info in scan {
+        scanned.push(CommitEntityChanges {
+            short_sha: info.short_sha.clone(),
+            author: info.author.clone(),
+            changed: cache.entity_changes_for(&info.sha).ok()?,
+        });
+    }
+    Some(aggregate_history_analytics(&scanned, file_path))
+}
+
+pub fn initialize_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;",
+    )?;
+    apply_performance_pragmas(conn)?;
+
+    let user_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if user_version != CACHE_SCHEMA_VERSION {
+        conn.execute_batch(CACHE_RESET_SQL)?;
+    }
+
+    let index_sql = CACHE_INDEXES
+        .iter()
+        .map(|(name, table, column)| {
+            format!("CREATE INDEX IF NOT EXISTS {name} ON {table}({column});")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let schema_sql = format!(
+        "{} {} PRAGMA user_version = {};",
+        CACHE_SCHEMA_SQL, index_sql, CACHE_SCHEMA_VERSION
+    );
+    conn.execute_batch(&schema_sql)
+}
+
+/// Stamp the cache with the repo root it was built from. The cache directory
+/// name is a hash, so without this a cache on disk can't be mapped back to
+/// its repo (used by `sem repos` to label local storage).
+pub fn set_cache_repo_root(tx: &Transaction<'_>, root: &Path) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        "INSERT OR REPLACE INTO cache_metadata (key, value) VALUES ('repo_root', ?1)",
+        params![root.to_string_lossy()],
+    )?;
+    Ok(())
+}
+
+pub fn set_cache_kind(tx: &Transaction<'_>, kind: &str) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        "INSERT OR REPLACE INTO cache_metadata (key, value) VALUES ('cache_kind', ?1)",
+        params![kind],
+    )?;
+    Ok(())
+}
+
+pub fn set_cache_source_scope(
+    tx: &Transaction<'_>,
+    source_scope: CacheSourceScope,
+) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        "DELETE FROM cache_metadata WHERE key = ?1",
+        params![CACHE_SOURCE_SCOPE_KEY],
+    )?;
+    if matches!(source_scope, CacheSourceScope::Default) {
+        tx.execute(
+            "INSERT INTO cache_metadata (key, value) VALUES (?1, ?2)",
+            params![CACHE_SOURCE_SCOPE_KEY, CACHE_SOURCE_SCOPE_DEFAULT],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn cache_has_default_source_scope(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT value FROM cache_metadata WHERE key = ?1",
+        params![CACHE_SOURCE_SCOPE_KEY],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .as_deref()
+        == Some(CACHE_SOURCE_SCOPE_DEFAULT)
+}
+
+pub fn cache_has_source_scope(conn: &Connection, source_scope: CacheSourceScope) -> bool {
+    let is_default = cache_has_default_source_scope(conn);
+    match source_scope {
+        CacheSourceScope::Default => is_default,
+        CacheSourceScope::Custom => !is_default,
+    }
+}
+
+pub fn cache_has_kind(conn: &Connection, accepted: &[&str]) -> bool {
+    conn.query_row(
+        "SELECT value FROM cache_metadata WHERE key = 'cache_kind'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .is_some_and(|kind| accepted.contains(&kind.as_str()))
+}
+
+pub fn cache_db_path(repo_root: &Path) -> Option<PathBuf> {
+    Some(cache_dir_for_repo(repo_root)?.join("cache.db"))
+}
+
+pub fn cache_dir_for_repo(repo_root: &Path) -> Option<PathBuf> {
+    Some(cache_root(repo_root)?.join(repo_cache_key(repo_root)))
+}
+
+pub fn create_cache_dir(cache_dir: &Path) -> Result<(), rusqlite::Error> {
+    std::fs::create_dir_all(cache_dir).map_err(|err| {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::CannotOpen,
+                extended_code: rusqlite::ffi::SQLITE_CANTOPEN,
+            },
+            Some(format!(
+                "failed to create cache directory {}: {}",
+                cache_dir.display(),
+                err
+            )),
+        )
+    })
+}
+
+fn cache_root(repo_root: &Path) -> Option<PathBuf> {
+    let repo_lexical = normalize_lexical(&absolute_path(repo_root));
+    let repo_resolved = canonicalize_existing_prefix(&repo_lexical);
+
+    for candidate in cache_root_candidates() {
+        let lexical = normalize_lexical(&absolute_path(&candidate));
+        let resolved = canonicalize_existing_prefix(&lexical);
+        if path_is_external_to_repo(&lexical, &resolved, &repo_lexical, &repo_resolved) {
+            return Some(resolved);
+        }
+    }
+
+    fallback_external_cache_root(&repo_lexical, &repo_resolved)
+}
+
+fn cache_root_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = non_empty_env("SEM_CACHE_DIR") {
+        candidates.push(path);
+    }
+    if cfg!(target_os = "windows") {
+        if let Some(path) = non_empty_env("LOCALAPPDATA").or_else(|| non_empty_env("APPDATA")) {
+            candidates.push(path.join("sem").join("repos"));
+        }
+    } else {
+        if let Some(path) = non_empty_env("XDG_CACHE_HOME") {
+            candidates.push(path.join("sem").join("repos"));
+        }
+
+        if cfg!(target_os = "macos") {
+            if let Some(home) = non_empty_env("HOME") {
+                candidates.push(
+                    home.join("Library")
+                        .join("Caches")
+                        .join("sem")
+                        .join("repos"),
+                );
+            }
+        }
+    }
+
+    if let Some(home) = non_empty_env("HOME").or_else(|| non_empty_env("USERPROFILE")) {
+        candidates.push(home.join(".cache").join("sem").join("repos"));
+    }
+
+    candidates.push(env::temp_dir().join("sem").join("repos"));
+    candidates
+}
+
+fn fallback_external_cache_root(repo_lexical: &Path, repo_resolved: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(parent) = repo_resolved.parent() {
+        candidates.push(parent.join(".sem-cache").join("repos"));
+    }
+    candidates.push(env::temp_dir().join("sem").join("repos"));
+
+    for candidate in candidates {
+        let lexical = normalize_lexical(&absolute_path(&candidate));
+        let resolved = canonicalize_existing_prefix(&lexical);
+        if path_is_external_to_repo(&lexical, &resolved, repo_lexical, repo_resolved) {
+            return Some(resolved);
+        }
+    }
+
+    None
+}
+
+fn path_is_external_to_repo(
+    candidate_lexical: &Path,
+    candidate_resolved: &Path,
+    repo_lexical: &Path,
+    repo_resolved: &Path,
+) -> bool {
+    let lexical_is_inside =
+        candidate_lexical.starts_with(repo_lexical) || candidate_lexical.starts_with(repo_resolved);
+    let resolved_is_inside = candidate_resolved.starts_with(repo_lexical)
+        || candidate_resolved.starts_with(repo_resolved);
+
+    !lexical_is_inside && !resolved_is_inside
+}
+
+fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+    let mut missing = Vec::<OsString>::new();
+
+    for ancestor in path.ancestors() {
+        if let Ok(existing) = ancestor.canonicalize() {
+            let mut resolved = normalize_lexical(&existing);
+            for part in missing.iter().rev() {
+                resolved.push(part);
+            }
+            return normalize_lexical(&resolved);
+        }
+
+        if let Some(part) = ancestor.file_name() {
+            missing.push(part.to_os_string());
+        }
+    }
+
+    normalize_lexical(path)
+}
+
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    let mut has_prefix = false;
+    let mut has_root = false;
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) => {
+                has_prefix = true;
+                normalized.push(component.as_os_str());
+            }
+            Component::RootDir => {
+                has_root = true;
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized.as_os_str().is_empty() {
+                    if !has_prefix && !has_root {
+                        normalized.push("..");
+                    }
+                } else if normalized.ends_with("..") {
+                    normalized.push("..");
+                } else if !normalized.pop() {
+                    if !has_prefix && !has_root {
+                        normalized.push("..");
+                    }
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    normalized
+}
+
+fn non_empty_env(name: &str) -> Option<PathBuf> {
+    env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn repo_cache_key(repo_root: &Path) -> String {
+    let canonical = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| absolute_path(repo_root));
+    let mut hash = 0xcbf29ce484222325u64;
+
+    for byte in canonical.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+
+    format!("{hash:016x}")
+}
+
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
 
 /// Result of a partial cache load: stale files that need reparsing, plus cached clean data.
 pub struct PartialCache {
     pub stale_files: Vec<String>,
     pub cached_entities: Vec<SemanticEntity>,
     pub cached_edges: Vec<EntityRef>,
+    pub cached_importing_stale_files: Vec<String>,
     /// Cached entities from stale files (for entity-level content_hash comparison)
     pub stale_file_entities: Vec<SemanticEntity>,
 }
 
 /// Compute a manifest hash from file paths + mtimes.
-/// If any file can't be stat'd, returns None.
+/// If any source file can't be stat'd, returns None.
 pub fn compute_manifest_hash(root: &Path, files: &[String]) -> Option<u64> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for file in files {
         let full = root.join(file);
-        let meta = std::fs::metadata(&full).ok()?;
-        let mtime = meta.modified().ok()?;
-        let dur = mtime
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
+        let (secs, nanos) = file_mtime_parts(&full)?;
         file.hash(&mut hasher);
-        dur.as_secs().hash(&mut hasher);
-        dur.subsec_nanos().hash(&mut hasher);
+        secs.hash(&mut hasher);
+        nanos.hash(&mut hasher);
     }
     files.len().hash(&mut hasher);
+
+    for (file_name, _) in CACHE_MANIFEST_FILES {
+        let full = root.join(file_name);
+        if !full.exists() {
+            continue;
+        }
+
+        file_name.hash(&mut hasher);
+        match file_mtime_parts(&full) {
+            Some((secs, nanos)) => {
+                true.hash(&mut hasher);
+                secs.hash(&mut hasher);
+                nanos.hash(&mut hasher);
+            }
+            None => {
+                false.hash(&mut hasher);
+            }
+        }
+    }
+
     Some(hasher.finish())
+}
+
+pub fn file_mtime_parts(path: &Path) -> Option<(i64, i64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    let dur = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    Some((dur.as_secs() as i64, dur.subsec_nanos() as i64))
+}
+
+pub fn file_content_hash(path: &Path) -> Option<String> {
+    let content = std::fs::read(path).ok()?;
+    Some(content_hash_bytes(&content))
+}
+
+pub fn file_fingerprint(path: &Path) -> Option<(i64, i64, String)> {
+    let (secs, nanos) = file_mtime_parts(path)?;
+    let hash = file_content_hash(path)?;
+    Some((secs, nanos, hash))
+}
+
+pub enum FileFreshness {
+    Fresh,
+    FreshWithUpdatedFingerprint {
+        secs: i64,
+        nanos: i64,
+        content_hash: String,
+    },
+    Stale,
+}
+
+pub struct FileFingerprintRefresh {
+    pub path: String,
+    pub mtime_secs: i64,
+    pub mtime_nanos: i64,
+    pub content_hash: String,
+}
+
+pub fn refresh_file_fingerprints(
+    conn: &Connection,
+    refreshes: &[FileFingerprintRefresh],
+) -> Result<(), rusqlite::Error> {
+    if refreshes.is_empty() {
+        return Ok(());
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "UPDATE files SET mtime_secs = ?2, mtime_nanos = ?3, content_hash = ?4 WHERE path = ?1",
+        )?;
+        for refresh in refreshes {
+            stmt.execute(params![
+                &refresh.path,
+                refresh.mtime_secs,
+                refresh.mtime_nanos,
+                &refresh.content_hash
+            ])?;
+        }
+    }
+    tx.commit()
+}
+
+/// Attempts to persist refreshed file fingerprints without changing cache-hit validity.
+pub fn refresh_file_fingerprints_best_effort(
+    conn: &Connection,
+    refreshes: &[FileFingerprintRefresh],
+) {
+    let _ = refresh_file_fingerprints(conn, refreshes);
+}
+
+pub fn file_freshness(
+    path: &Path,
+    cached_secs: i64,
+    cached_nanos: i64,
+    cached_content_hash: Option<&str>,
+) -> Option<FileFreshness> {
+    let (current_secs, current_nanos) = file_mtime_parts(path)?;
+    if cached_secs == current_secs && cached_nanos == current_nanos {
+        return Some(FileFreshness::Fresh);
+    }
+
+    let cached_content_hash = cached_content_hash?;
+    let current_content_hash = file_content_hash(path)?;
+    if current_content_hash == cached_content_hash {
+        return Some(FileFreshness::FreshWithUpdatedFingerprint {
+            secs: current_secs,
+            nanos: current_nanos,
+            content_hash: current_content_hash,
+        });
+    }
+
+    Some(FileFreshness::Stale)
+}
+
+pub fn is_cache_manifest_key(path: &str) -> bool {
+    CACHE_MANIFEST_FILES
+        .iter()
+        .any(|(_, cache_key)| *cache_key == path)
+}
+
+pub fn is_manifest_file_name(path: &str) -> bool {
+    CACHE_MANIFEST_FILES
+        .iter()
+        .any(|(file_name, _)| *file_name == path)
+}
+
+pub fn source_file_count(files: &[String]) -> usize {
+    files
+        .iter()
+        .filter(|file| !is_manifest_file_name(file))
+        .count()
+}
+
+fn cached_file_fingerprint(
+    conn: &Connection,
+    cache_key: &str,
+) -> Option<(i64, i64, Option<String>)> {
+    conn.query_row(
+        "SELECT mtime_secs, mtime_nanos, content_hash FROM files WHERE path = ?1",
+        params![cache_key],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .ok()
+}
+
+pub fn is_manifest_stale(conn: &Connection, root: &Path) -> bool {
+    let mut fingerprint_refreshes = Vec::new();
+    for (file_name, cache_key) in CACHE_MANIFEST_FILES {
+        let full = root.join(file_name);
+        let cached = cached_file_fingerprint(conn, cache_key);
+
+        match (full.exists(), cached) {
+            (true, None) | (false, Some(_)) => return true,
+            (false, None) => {}
+            (true, Some((secs, nanos, content_hash))) => {
+                match file_freshness(&full, secs, nanos, content_hash.as_deref()) {
+                    Some(FileFreshness::Fresh) => {}
+                    Some(FileFreshness::FreshWithUpdatedFingerprint {
+                        secs,
+                        nanos,
+                        content_hash,
+                    }) => {
+                        fingerprint_refreshes.push(FileFingerprintRefresh {
+                            path: (*cache_key).to_string(),
+                            mtime_secs: secs,
+                            mtime_nanos: nanos,
+                            content_hash,
+                        });
+                    }
+                    Some(FileFreshness::Stale) | None => return true,
+                }
+            }
+        }
+    }
+
+    refresh_file_fingerprints_best_effort(conn, &fingerprint_refreshes);
+    false
+}
+
+pub fn manifest_entry_count(conn: &Connection) -> i64 {
+    CACHE_MANIFEST_FILES
+        .iter()
+        .map(|(_, cache_key)| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM files WHERE path = ?1",
+                params![cache_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+        })
+        .sum()
+}
+
+pub fn refresh_manifest_entries(tx: &Transaction<'_>, root: &Path) -> Result<(), rusqlite::Error> {
+    {
+        let mut delete = tx.prepare("DELETE FROM files WHERE path = ?1")?;
+        for (_, cache_key) in CACHE_MANIFEST_FILES {
+            delete.execute(params![cache_key])?;
+        }
+    }
+
+    let mut insert = tx.prepare(
+        "INSERT OR REPLACE INTO files (path, mtime_secs, mtime_nanos, content_hash) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (file_name, cache_key) in CACHE_MANIFEST_FILES {
+        let full = root.join(file_name);
+        if let Some((secs, nanos, content_hash)) = file_fingerprint(&full) {
+            insert.execute(params![cache_key, secs, nanos, content_hash])?;
+        }
+    }
+
+    Ok(())
+}
+
+pub fn refresh_file_import_entries(
+    tx: &Transaction<'_>,
+    root: &Path,
+    files_to_refresh: &[String],
+    all_files: &[String],
+) -> Result<(), rusqlite::Error> {
+    let candidate_files: Vec<String> = all_files
+        .iter()
+        .filter(|file| !is_manifest_file_name(file))
+        .cloned()
+        .collect();
+
+    let mut delete = tx.prepare("DELETE FROM file_imports WHERE importing_file = ?1")?;
+    let mut insert = tx.prepare(
+        "INSERT OR IGNORE INTO file_imports (importing_file, imported_file) VALUES (?1, ?2)",
+    )?;
+
+    for file in files_to_refresh {
+        if is_manifest_file_name(file) {
+            continue;
+        }
+
+        delete.execute(params![file])?;
+        let Ok(content) = std::fs::read_to_string(root.join(file)) else {
+            continue;
+        };
+        for imported_file in
+            js_ts_import_source_files_from_content(file, &content, &candidate_files)
+        {
+            insert.execute(params![file, imported_file])?;
+        }
+    }
+
+    Ok(())
+}
+
+pub fn cached_importing_files_for_stale_files(
+    conn: &Connection,
+    stale_files: &[String],
+    current_source_files: &[&String],
+) -> Vec<String> {
+    let current_set: HashSet<&str> = current_source_files
+        .iter()
+        .map(|file| file.as_str())
+        .collect();
+    let stale_set: HashSet<&str> = stale_files.iter().map(String::as_str).collect();
+    let mut importing_files = HashSet::new();
+    let Ok(mut stmt) =
+        conn.prepare("SELECT DISTINCT importing_file FROM file_imports WHERE imported_file = ?1")
+    else {
+        return Vec::new();
+    };
+
+    for stale_file in stale_files {
+        let Ok(rows) = stmt.query_map(params![stale_file], |row| row.get::<_, String>(0)) else {
+            continue;
+        };
+        for importing_file in rows.filter_map(|row| row.ok()) {
+            if current_set.contains(importing_file.as_str())
+                && !stale_set.contains(importing_file.as_str())
+            {
+                importing_files.insert(importing_file);
+            }
+        }
+    }
+
+    let mut importing_files: Vec<String> = importing_files.into_iter().collect();
+    importing_files.sort_unstable();
+    importing_files
 }
 
 pub struct DiskCache {
@@ -40,40 +937,112 @@ pub struct DiskCache {
 
 impl DiskCache {
     pub fn open(repo_root: &Path) -> Result<Self, rusqlite::Error> {
-        let cache_dir = repo_root.join(".sem");
-        std::fs::create_dir_all(&cache_dir).ok();
+        let cache_dir = cache_dir_for_repo(repo_root)
+            .ok_or_else(|| rusqlite::Error::InvalidPath(repo_root.to_path_buf()))?;
+        create_cache_dir(&cache_dir)?;
         let db_path = cache_dir.join("cache.db");
         let conn = Connection::open(db_path)?;
 
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             CREATE TABLE IF NOT EXISTS files (
-                 path TEXT PRIMARY KEY,
-                 mtime_secs INTEGER NOT NULL,
-                 mtime_nanos INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS entities (
-                 id TEXT PRIMARY KEY,
-                 name TEXT NOT NULL,
-                 entity_type TEXT NOT NULL,
-                 file_path TEXT NOT NULL,
-                 start_line INTEGER NOT NULL,
-                 end_line INTEGER NOT NULL,
-                 content TEXT NOT NULL,
-                 content_hash TEXT NOT NULL,
-                 structural_hash TEXT,
-                 parent_id TEXT,
-                 metadata_json TEXT
-             );
-             CREATE TABLE IF NOT EXISTS edges (
-                 from_entity TEXT NOT NULL,
-                 to_entity TEXT NOT NULL,
-                 ref_type TEXT NOT NULL
-             );",
-        )?;
+        initialize_schema(&conn)?;
 
         Ok(Self { conn })
+    }
+
+    /// Index every commit in `commits` that the store has not seen: semantic
+    /// diff against its first parent, persisted as entity-change rows. Merge
+    /// commits are stored with zero changes. Returns the number of commits
+    /// newly indexed.
+    pub fn index_commits(
+        &mut self,
+        git: &GitBridge,
+        registry: &ParserRegistry,
+        commits: &[CommitInfo],
+    ) -> Result<usize, rusqlite::Error> {
+        let mut newly_indexed = 0usize;
+        for info in commits {
+            let exists = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM commits WHERE sha = ?1",
+                    params![info.sha],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if exists {
+                continue;
+            }
+
+            let is_merge = git
+                .commit_parent_count(&info.sha)
+                .map(|n| n > 1)
+                .unwrap_or(false);
+            let changes = if is_merge {
+                Vec::new()
+            } else {
+                let scope = DiffScope::Commit {
+                    sha: info.sha.clone(),
+                };
+                match git.get_changed_files(&scope, &[]) {
+                    Ok(fc) => {
+                        compute_semantic_diff(&fc, registry, Some(&info.sha), Some(&info.author))
+                            .changes
+                    }
+                    Err(_) => Vec::new(),
+                }
+            };
+
+            let tx = self.conn.transaction()?;
+            tx.execute(
+                "INSERT OR REPLACE INTO commits (sha, short_sha, author, committed_at, message)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    info.sha,
+                    info.short_sha,
+                    info.author,
+                    info.date.parse::<i64>().unwrap_or(0),
+                    info.message,
+                ],
+            )?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO entity_changes
+                     (commit_sha, entity_name, entity_type, file_path, change_type,
+                      old_entity_name, old_file_path, structural)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )?;
+                for c in &changes {
+                    stmt.execute(params![
+                        info.sha,
+                        c.entity_name,
+                        c.entity_type,
+                        c.file_path,
+                        c.change_type.to_string(),
+                        c.old_entity_name,
+                        c.old_file_path,
+                        c.structural_change.map(i64::from),
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            newly_indexed += 1;
+        }
+        Ok(newly_indexed)
+    }
+
+    /// (entity_name, entity_type, file_path) rows stored for one commit.
+    pub fn entity_changes_for(
+        &self,
+        sha: &str,
+    ) -> Result<Vec<(String, String, String)>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT entity_name, entity_type, file_path
+             FROM entity_changes WHERE commit_sha = ?1",
+        )?;
+        let rows = stmt.query_map(params![sha], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        rows.collect()
     }
 
     /// Save the current graph + entities to the disk cache.
@@ -83,52 +1052,33 @@ impl DiskCache {
         files: &[String],
         graph: &EntityGraph,
         entities: &[SemanticEntity],
+        source_scope: CacheSourceScope,
     ) -> Result<(), rusqlite::Error> {
         let tx = self.conn.unchecked_transaction()?;
 
-        tx.execute_batch("DELETE FROM files; DELETE FROM entities; DELETE FROM edges;")?;
+        tx.execute_batch(
+            "DELETE FROM files; DELETE FROM entities; DELETE FROM edges; DELETE FROM file_imports; DELETE FROM entity_flags;",
+        )?;
 
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO files (path, mtime_secs, mtime_nanos) VALUES (?1, ?2, ?3)",
+                "INSERT INTO files (path, mtime_secs, mtime_nanos, content_hash) VALUES (?1, ?2, ?3, ?4)",
             )?;
             for file in files {
+                if is_manifest_file_name(file) {
+                    continue;
+                }
                 let full = root.join(file);
-                if let Ok(meta) = std::fs::metadata(&full) {
-                    if let Ok(mtime) = meta.modified() {
-                        let dur = mtime
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default();
-                        stmt.execute(params![file, dur.as_secs() as i64, dur.subsec_nanos() as i64])?;
-                    }
+                if let Some((secs, nanos, content_hash)) = file_fingerprint(&full) {
+                    stmt.execute(params![file, secs, nanos, content_hash])?;
                 }
             }
         }
 
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO entities (id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            )?;
-            for e in entities {
-                let metadata_json = e
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| serde_json::to_string(m).ok());
-                stmt.execute(params![
-                    e.id,
-                    e.name,
-                    e.entity_type,
-                    e.file_path,
-                    e.start_line as i64,
-                    e.end_line as i64,
-                    e.content,
-                    e.content_hash,
-                    e.structural_hash,
-                    e.parent_id,
-                    metadata_json,
-                ])?;
-            }
-        }
+        refresh_manifest_entries(&tx, root)?;
+        refresh_file_import_entries(&tx, root, files, files)?;
+
+        insert_entities_with_content_store(&tx, root, &entities.iter().collect::<Vec<_>>(), false)?;
 
         {
             let mut stmt = tx.prepare(
@@ -144,6 +1094,9 @@ impl DiskCache {
             }
         }
 
+        set_cache_kind(&tx, CACHE_KIND_FULL)?;
+        set_cache_source_scope(&tx, source_scope)?;
+        set_cache_repo_root(&tx, root)?;
         tx.commit()?;
         Ok(())
     }
@@ -154,40 +1107,76 @@ impl DiskCache {
         root: &Path,
         files: &[String],
     ) -> Option<(EntityGraph, Vec<SemanticEntity>)> {
+        self.load_with_source_scope(root, files, CacheSourceScope::Default)
+    }
+
+    pub fn load_with_source_scope(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: CacheSourceScope,
+    ) -> Option<(EntityGraph, Vec<SemanticEntity>)> {
+        if !cache_has_kind(&self.conn, &[CACHE_KIND_FULL]) {
+            return None;
+        }
+
+        if !cache_has_source_scope(&self.conn, source_scope) {
+            return None;
+        }
+
+        if is_manifest_stale(&self.conn, root) {
+            return None;
+        }
+
         // Verify file count matches
         let cached_count: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
             .ok()?;
-        if cached_count as usize != files.len() {
+        if (cached_count - manifest_entry_count(&self.conn)) as usize != source_file_count(files) {
             return None;
         }
 
         // Verify all mtimes match
         let mut stmt = self
             .conn
-            .prepare("SELECT mtime_secs, mtime_nanos FROM files WHERE path = ?1")
+            .prepare("SELECT mtime_secs, mtime_nanos, content_hash FROM files WHERE path = ?1")
             .ok()?;
+        let mut fingerprint_refreshes = Vec::new();
         for file in files {
-            let full = root.join(file);
-            let meta = std::fs::metadata(&full).ok()?;
-            let mtime = meta.modified().ok()?;
-            let dur = mtime
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
-
-            let (secs, nanos): (i64, i64) = stmt
-                .query_row(params![file], |row| Ok((row.get(0)?, row.get(1)?)))
+            if is_manifest_file_name(file) {
+                continue;
+            }
+            let (secs, nanos, content_hash): (i64, i64, Option<String>) = stmt
+                .query_row(params![file], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
                 .ok()?;
-            if secs != dur.as_secs() as i64 || nanos != dur.subsec_nanos() as i64 {
-                return None;
+            let full = root.join(file);
+            match file_freshness(&full, secs, nanos, content_hash.as_deref())? {
+                FileFreshness::Fresh => {}
+                FileFreshness::FreshWithUpdatedFingerprint {
+                    secs,
+                    nanos,
+                    content_hash,
+                } => {
+                    fingerprint_refreshes.push(FileFingerprintRefresh {
+                        path: file.clone(),
+                        mtime_secs: secs,
+                        mtime_nanos: nanos,
+                        content_hash,
+                    });
+                }
+                FileFreshness::Stale => return None,
             }
         }
+        drop(stmt);
+        refresh_file_fingerprints_best_effort(&self.conn, &fingerprint_refreshes);
 
         // Load entities
         let mut entity_stmt = self
             .conn
-            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json FROM entities")
+            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json, start_byte, end_byte FROM entities")
             .ok()?;
         let entities: Vec<SemanticEntity> = entity_stmt
             .query_map([], |row| {
@@ -200,7 +1189,9 @@ impl DiskCache {
                     file_path: row.get(3)?,
                     start_line: row.get::<_, i64>(4)? as usize,
                     end_line: row.get::<_, i64>(5)? as usize,
-                    content: row.get(6)?,
+                    start_byte: row.get::<_, Option<i64>>(11)?.map(|v| v as usize),
+                    end_byte: row.get::<_, Option<i64>>(12)?.map(|v| v as usize),
+                    content: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                     content_hash: row.get(7)?,
                     structural_hash: row.get(8)?,
                     parent_id: row.get(9)?,
@@ -210,6 +1201,20 @@ impl DiskCache {
             .ok()?
             .filter_map(|r| r.ok())
             .collect();
+
+        // Reconstruct span-sliced entity bodies from the file-content store.
+        let entities: Vec<SemanticEntity> = {
+            let mut recon = ContentReconstructor::new(&self.conn);
+            entities
+                .into_iter()
+                .map(|mut e| {
+                    if e.content.is_empty() {
+                        e.content = recon.content(&e.file_path, None, e.start_byte, e.end_byte);
+                    }
+                    e
+                })
+                .collect()
+        };
 
         // Load edges
         let mut edge_stmt = self
@@ -235,7 +1240,7 @@ impl DiskCache {
             .collect();
 
         // Build entity map for graph
-        let entity_map: HashMap<String, EntityInfo> = entities
+        let entity_map: EntityInfoMap = entities
             .iter()
             .map(|e| {
                 (
@@ -257,80 +1262,262 @@ impl DiskCache {
         Some((graph, entities))
     }
 
-    /// Load a partial cache: identify stale files and return clean cached data.
-    /// Returns None if cache is empty or ALL files are stale (full rebuild is better).
-    pub fn load_partial(
+    /// Load only graph topology from a fresh cache.
+    pub fn load_graph_topology(&self, root: &Path, files: &[String]) -> Option<EntityGraph> {
+        self.load_graph_topology_with_source_scope(root, files, CacheSourceScope::Default)
+    }
+
+    pub fn load_graph_topology_with_source_scope(
         &self,
         root: &Path,
         files: &[String],
-    ) -> Option<PartialCache> {
+        source_scope: CacheSourceScope,
+    ) -> Option<EntityGraph> {
+        if !cache_has_kind(&self.conn, &[CACHE_KIND_FULL, CACHE_KIND_TOPOLOGY]) {
+            return None;
+        }
+
+        if !cache_has_source_scope(&self.conn, source_scope) {
+            return None;
+        }
+
+        if is_manifest_stale(&self.conn, root) {
+            return None;
+        }
+
+        let cached_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .ok()?;
+        if (cached_count - manifest_entry_count(&self.conn)) as usize != source_file_count(files) {
+            return None;
+        }
+
         let mut stmt = self
             .conn
-            .prepare("SELECT path, mtime_secs, mtime_nanos FROM files")
+            .prepare("SELECT path, mtime_secs, mtime_nanos, content_hash FROM files")
             .ok()?;
-        let cached_files: HashMap<String, (i64, i64)> = stmt
+        let cached_mtimes: HashMap<String, (i64, i64, Option<String>)> = stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
+                    (
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ),
+                ))
+            })
+            .ok()?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        let mut fingerprint_refreshes = Vec::new();
+        for file in files {
+            if is_manifest_file_name(file) {
+                continue;
+            }
+            let (secs, nanos, content_hash) = cached_mtimes.get(file.as_str())?;
+            let full = root.join(file);
+            match file_freshness(&full, *secs, *nanos, content_hash.as_deref())? {
+                FileFreshness::Fresh => {}
+                FileFreshness::FreshWithUpdatedFingerprint {
+                    secs,
+                    nanos,
+                    content_hash,
+                } => {
+                    fingerprint_refreshes.push(FileFingerprintRefresh {
+                        path: file.clone(),
+                        mtime_secs: secs,
+                        mtime_nanos: nanos,
+                        content_hash,
+                    });
+                }
+                FileFreshness::Stale => return None,
+            }
+        }
+        refresh_file_fingerprints_best_effort(&self.conn, &fingerprint_refreshes);
+
+        let mut entity_stmt = self
+            .conn
+            .prepare(
+                "SELECT id, name, entity_type, file_path, start_line, end_line, parent_id FROM entities",
+            )
+            .ok()?;
+        let entity_map: EntityInfoMap = entity_stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                Ok((
+                    id.clone(),
+                    EntityInfo {
+                        id,
+                        name: row.get(1)?,
+                        entity_type: row.get(2)?,
+                        file_path: row.get(3)?,
+                        start_line: row.get::<_, i64>(4)? as usize,
+                        end_line: row.get::<_, i64>(5)? as usize,
+                        parent_id: row.get(6)?,
+                    },
                 ))
             })
             .ok()?
             .filter_map(|r| r.ok())
             .collect();
 
+        let edges = self.load_edges()?;
+        Some(EntityGraph::from_parts(entity_map, edges))
+    }
+
+    fn load_edges(&self) -> Option<Vec<EntityRef>> {
+        let mut edge_stmt = self
+            .conn
+            .prepare("SELECT from_entity, to_entity, ref_type FROM edges")
+            .ok()?;
+        let edges: Vec<EntityRef> = edge_stmt
+            .query_map([], |row| {
+                let rt: String = row.get(2)?;
+                let ref_type = match rt.as_str() {
+                    "calls" => RefType::Calls,
+                    "imports" => RefType::Imports,
+                    _ => RefType::TypeRef,
+                };
+                Ok(EntityRef {
+                    from_entity: row.get(0)?,
+                    to_entity: row.get(1)?,
+                    ref_type,
+                })
+            })
+            .ok()?
+            .filter_map(|r| r.ok())
+            .collect();
+        Some(edges)
+    }
+
+    /// Load a partial cache: identify stale files and return clean cached data.
+    /// Returns None if cache is empty or ALL files are stale (full rebuild is better).
+    pub fn load_partial(&self, root: &Path, files: &[String]) -> Option<PartialCache> {
+        self.load_partial_with_source_scope(root, files, CacheSourceScope::Default)
+    }
+
+    pub fn load_partial_with_source_scope(
+        &self,
+        root: &Path,
+        files: &[String],
+        source_scope: CacheSourceScope,
+    ) -> Option<PartialCache> {
+        if !cache_has_kind(&self.conn, &[CACHE_KIND_FULL]) {
+            return None;
+        }
+
+        if !cache_has_source_scope(&self.conn, source_scope) {
+            return None;
+        }
+
+        if is_manifest_stale(&self.conn, root) {
+            return None;
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, mtime_secs, mtime_nanos, content_hash FROM files")
+            .ok()?;
+        let cached_files: HashMap<String, (i64, i64, Option<String>)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ),
+                ))
+            })
+            .ok()?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
         if cached_files.is_empty() {
             return None;
         }
 
-        let current_set: HashSet<&str> = files.iter().map(|s| s.as_str()).collect();
+        let source_files: Vec<&String> = files
+            .iter()
+            .filter(|file| !is_manifest_file_name(file))
+            .collect();
+        let source_file_count = source_files.len();
+        let current_set: HashSet<&str> = source_files.iter().map(|file| file.as_str()).collect();
 
-        let mut stale_files: Vec<String> = Vec::new();
-        for file in files {
-            match cached_files.get(file) {
-                Some(&(secs, nanos)) => {
-                    let full = root.join(file);
-                    let meta = std::fs::metadata(&full).ok();
-                    let is_stale = meta
-                        .and_then(|m| m.modified().ok())
-                        .map(|mtime| {
-                            let dur = mtime
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default();
-                            secs != dur.as_secs() as i64 || nanos != dur.subsec_nanos() as i64
-                        })
-                        .unwrap_or(true);
-                    if is_stale {
-                        stale_files.push(file.clone());
+        let mut stale_source_files: Vec<String> = Vec::new();
+        let mut stale_current_file_count = 0;
+        let mut fingerprint_refreshes = Vec::new();
+        for file in &source_files {
+            match cached_files.get(file.as_str()) {
+                Some((secs, nanos, content_hash)) => {
+                    let full = root.join(file.as_str());
+                    match file_freshness(&full, *secs, *nanos, content_hash.as_deref()) {
+                        Some(FileFreshness::Fresh) => {}
+                        Some(FileFreshness::FreshWithUpdatedFingerprint {
+                            secs,
+                            nanos,
+                            content_hash,
+                        }) => {
+                            fingerprint_refreshes.push(FileFingerprintRefresh {
+                                path: (*file).clone(),
+                                mtime_secs: secs,
+                                mtime_nanos: nanos,
+                                content_hash,
+                            });
+                        }
+                        Some(FileFreshness::Stale) | None => {
+                            stale_current_file_count += 1;
+                            stale_source_files.push((*file).clone());
+                        }
                     }
                 }
                 None => {
-                    stale_files.push(file.clone());
+                    stale_current_file_count += 1;
+                    stale_source_files.push((*file).clone());
                 }
             }
         }
 
         // Files in cache but not on disk anymore
+        let mut deleted_cached_files: Vec<String> = Vec::new();
         for cached_path in cached_files.keys() {
-            if !current_set.contains(cached_path.as_str()) {
-                stale_files.push(cached_path.clone());
+            if !is_cache_manifest_key(cached_path)
+                && !is_manifest_file_name(cached_path)
+                && !current_set.contains(cached_path.as_str())
+            {
+                deleted_cached_files.push(cached_path.clone());
             }
         }
 
-        if stale_files.is_empty() {
+        refresh_file_fingerprints_best_effort(&self.conn, &fingerprint_refreshes);
+
+        if stale_source_files.is_empty() && deleted_cached_files.is_empty() {
             return None;
         }
 
-        if stale_files.len() >= files.len() {
+        if stale_current_file_count >= source_file_count {
             return None;
         }
 
-        let stale_set: HashSet<&str> = stale_files.iter().map(|s| s.as_str()).collect();
+        let stale_set: HashSet<&str> = stale_source_files
+            .iter()
+            .chain(deleted_cached_files.iter())
+            .map(|s| s.as_str())
+            .collect();
+        let mut import_stale_files = stale_source_files.clone();
+        import_stale_files.extend(deleted_cached_files.iter().cloned());
+        let cached_importing_stale_files =
+            cached_importing_files_for_stale_files(&self.conn, &import_stale_files, &source_files);
 
         // Load ALL entities, split into clean vs stale-file
         let mut entity_stmt = self
             .conn
-            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json FROM entities")
+            .prepare("SELECT id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json, start_byte, end_byte FROM entities")
             .ok()?;
         let all_cached: Vec<SemanticEntity> = entity_stmt
             .query_map([], |row| {
@@ -343,7 +1530,9 @@ impl DiskCache {
                     file_path: row.get(3)?,
                     start_line: row.get::<_, i64>(4)? as usize,
                     end_line: row.get::<_, i64>(5)? as usize,
-                    content: row.get(6)?,
+                    start_byte: row.get::<_, Option<i64>>(11)?.map(|v| v as usize),
+                    end_byte: row.get::<_, Option<i64>>(12)?.map(|v| v as usize),
+                    content: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                     content_hash: row.get(7)?,
                     structural_hash: row.get(8)?,
                     parent_id: row.get(9)?,
@@ -353,6 +1542,19 @@ impl DiskCache {
             .ok()?
             .filter_map(|r| r.ok())
             .collect();
+
+        let all_cached: Vec<SemanticEntity> = {
+            let mut recon = ContentReconstructor::new(&self.conn);
+            all_cached
+                .into_iter()
+                .map(|mut e| {
+                    if e.content.is_empty() {
+                        e.content = recon.content(&e.file_path, None, e.start_byte, e.end_byte);
+                    }
+                    e
+                })
+                .collect()
+        };
 
         let mut cached_entities = Vec::new();
         let mut stale_file_entities = Vec::new();
@@ -387,15 +1589,11 @@ impl DiskCache {
             .filter_map(|r| r.ok())
             .collect();
 
-        let stale_files: Vec<String> = stale_files
-            .into_iter()
-            .filter(|f| current_set.contains(f.as_str()))
-            .collect();
-
         Some(PartialCache {
-            stale_files,
+            stale_files: stale_source_files,
             cached_entities,
             cached_edges,
+            cached_importing_stale_files,
             stale_file_entities,
         })
     }
@@ -408,86 +1606,152 @@ impl DiskCache {
         stale_files: &[String],
         graph: &EntityGraph,
         entities: &[SemanticEntity],
+        source_scope: CacheSourceScope,
     ) -> Result<(), rusqlite::Error> {
-        let stale_set: HashSet<&str> = stale_files.iter().map(|s| s.as_str()).collect();
+        self.save_incremental_with_repair_metadata(
+            root,
+            all_files,
+            stale_files,
+            graph,
+            entities,
+            false,
+            &[],
+            &[],
+            source_scope,
+        )
+    }
+
+    /// Incrementally update the cache with graph-repair metadata.
+    pub fn save_incremental_with_repair_metadata(
+        &self,
+        root: &Path,
+        all_files: &[String],
+        stale_files: &[String],
+        graph: &EntityGraph,
+        entities: &[SemanticEntity],
+        repair_changed_clean_entity_ids: bool,
+        recomputed_edge_source_ids: &[String],
+        deleted_entity_ids: &[String],
+        source_scope: CacheSourceScope,
+    ) -> Result<(), rusqlite::Error> {
+        let source_stale_files: Vec<&String> = stale_files
+            .iter()
+            .filter(|file| !is_manifest_file_name(file))
+            .collect();
+        let source_stale_set: HashSet<&str> = source_stale_files
+            .iter()
+            .map(|file| file.as_str())
+            .collect();
 
         let tx = self.conn.unchecked_transaction()?;
 
         {
             let mut del_files = tx.prepare("DELETE FROM files WHERE path = ?1")?;
-            for f in stale_files {
+            for f in &source_stale_files {
                 del_files.execute(params![f])?;
             }
         }
 
-        {
-            let current_set: HashSet<&str> = all_files.iter().map(|s| s.as_str()).collect();
+        let current_set: HashSet<&str> = all_files
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|path| !is_manifest_file_name(path))
+            .collect();
+        let cached_paths: Vec<String> = {
             let mut cached_stmt = tx.prepare("SELECT path FROM files")?;
-            let cached_paths: Vec<String> = cached_stmt
+            cached_stmt
                 .query_map([], |row| row.get(0))
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default();
+                .unwrap_or_default()
+        };
+        let deleted_cached_files: Vec<String> = cached_paths
+            .into_iter()
+            .filter(|path| {
+                !is_cache_manifest_key(path)
+                    && !is_manifest_file_name(path)
+                    && !current_set.contains(path.as_str())
+            })
+            .collect();
+        let use_legacy_edge_fallback = !repair_changed_clean_entity_ids
+            && recomputed_edge_source_ids.is_empty()
+            && deleted_entity_ids.is_empty();
+        let cached_rewritten_entity_ids: HashSet<String> = if use_legacy_edge_fallback {
+            let rewritten_file_paths: HashSet<&str> = source_stale_files
+                .iter()
+                .map(|file| file.as_str())
+                .chain(deleted_cached_files.iter().map(String::as_str))
+                .collect();
+            let mut stmt = tx.prepare("SELECT id, file_path FROM entities")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.filter_map(|row| row.ok())
+                .filter_map(|(id, file_path)| {
+                    rewritten_file_paths
+                        .contains(file_path.as_str())
+                        .then_some(id)
+                })
+                .collect()
+        } else {
+            HashSet::new()
+        };
+
+        {
             let mut del_files = tx.prepare("DELETE FROM files WHERE path = ?1")?;
-            for path in &cached_paths {
-                if !current_set.contains(path.as_str()) {
-                    del_files.execute(params![path])?;
-                }
+            for path in &deleted_cached_files {
+                del_files.execute(params![path])?;
             }
         }
 
         {
             let mut ins = tx.prepare(
-                "INSERT OR REPLACE INTO files (path, mtime_secs, mtime_nanos) VALUES (?1, ?2, ?3)",
+                "INSERT OR REPLACE INTO files (path, mtime_secs, mtime_nanos, content_hash) VALUES (?1, ?2, ?3, ?4)",
             )?;
-            for file in stale_files {
+            for file in &source_stale_files {
                 let full = root.join(file);
-                if let Ok(meta) = std::fs::metadata(&full) {
-                    if let Ok(mtime) = meta.modified() {
-                        let dur = mtime
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default();
-                        ins.execute(params![file, dur.as_secs() as i64, dur.subsec_nanos() as i64])?;
-                    }
+                if let Some((secs, nanos, content_hash)) = file_fingerprint(&full) {
+                    ins.execute(params![file, secs, nanos, content_hash])?;
                 }
             }
         }
 
-        {
+        refresh_manifest_entries(&tx, root)?;
+        let mut import_files_to_refresh: Vec<String> = source_stale_files
+            .iter()
+            .map(|file| (*file).clone())
+            .collect();
+        import_files_to_refresh.extend(deleted_cached_files.iter().cloned());
+        refresh_file_import_entries(&tx, root, &import_files_to_refresh, all_files)?;
+
+        if repair_changed_clean_entity_ids {
+            tx.execute("DELETE FROM entities", [])?;
+            tx.execute("DELETE FROM file_contents", [])?;
+        } else {
             let mut del = tx.prepare("DELETE FROM entities WHERE file_path = ?1")?;
-            for f in stale_files {
+            let mut del_fc = tx.prepare("DELETE FROM file_contents WHERE path = ?1")?;
+            for f in &source_stale_files {
                 del.execute(params![f])?;
+                del_fc.execute(params![f])?;
+            }
+            for f in &deleted_cached_files {
+                del.execute(params![f])?;
+                del_fc.execute(params![f])?;
             }
         }
 
         {
-            let mut ins = tx.prepare(
-                "INSERT OR REPLACE INTO entities (id, name, entity_type, file_path, start_line, end_line, content, content_hash, structural_hash, parent_id, metadata_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            )?;
-            for e in entities {
-                if stale_set.contains(e.file_path.as_str()) {
-                    let metadata_json = e
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| serde_json::to_string(m).ok());
-                    ins.execute(params![
-                        e.id,
-                        e.name,
-                        e.entity_type,
-                        e.file_path,
-                        e.start_line as i64,
-                        e.end_line as i64,
-                        e.content,
-                        e.content_hash,
-                        e.structural_hash,
-                        e.parent_id,
-                        metadata_json,
-                    ])?;
-                }
-            }
+            let to_insert: Vec<&SemanticEntity> = entities
+                .iter()
+                .filter(|e| {
+                    repair_changed_clean_entity_ids
+                        || source_stale_set.contains(e.file_path.as_str())
+                })
+                .collect();
+            insert_entities_with_content_store(&tx, root, &to_insert, true)?;
         }
 
-        tx.execute("DELETE FROM edges", [])?;
-        {
+        if repair_changed_clean_entity_ids {
+            tx.execute("DELETE FROM edges", [])?;
             let mut ins = tx.prepare(
                 "INSERT INTO edges (from_entity, to_entity, ref_type) VALUES (?1, ?2, ?3)",
             )?;
@@ -499,9 +1763,1077 @@ impl DiskCache {
                 };
                 ins.execute(params![edge.from_entity, edge.to_entity, rt])?;
             }
+        } else {
+            let mut affected_sources: HashSet<String> =
+                recomputed_edge_source_ids.iter().cloned().collect();
+            let mut deleted_ids: HashSet<String> = deleted_entity_ids.iter().cloned().collect();
+            if use_legacy_edge_fallback {
+                let current_rewritten_entity_ids: HashSet<&str> = entities
+                    .iter()
+                    .filter(|entity| source_stale_set.contains(entity.file_path.as_str()))
+                    .map(|entity| entity.id.as_str())
+                    .collect();
+                affected_sources.extend(cached_rewritten_entity_ids.iter().cloned());
+                affected_sources.extend(
+                    current_rewritten_entity_ids
+                        .iter()
+                        .map(|entity_id| (*entity_id).to_string()),
+                );
+                deleted_ids.extend(
+                    cached_rewritten_entity_ids
+                        .iter()
+                        .filter(|entity_id| {
+                            !current_rewritten_entity_ids.contains(entity_id.as_str())
+                        })
+                        .cloned(),
+                );
+            }
+            affected_sources.extend(deleted_ids.iter().cloned());
+
+            {
+                let mut del_from = tx.prepare("DELETE FROM edges WHERE from_entity = ?1")?;
+                for entity_id in &affected_sources {
+                    del_from.execute(params![entity_id])?;
+                }
+            }
+            {
+                let mut del_to = tx.prepare("DELETE FROM edges WHERE to_entity = ?1")?;
+                for entity_id in &deleted_ids {
+                    del_to.execute(params![entity_id])?;
+                }
+            }
+
+            let mut ins = tx.prepare(
+                "INSERT INTO edges (from_entity, to_entity, ref_type) VALUES (?1, ?2, ?3)",
+            )?;
+            for edge in &graph.edges {
+                if !affected_sources.contains(&edge.from_entity)
+                    || deleted_ids.contains(&edge.from_entity)
+                    || deleted_ids.contains(&edge.to_entity)
+                {
+                    continue;
+                }
+                let rt = match edge.ref_type {
+                    RefType::Calls => "calls",
+                    RefType::TypeRef => "typeref",
+                    RefType::Imports => "imports",
+                };
+                ins.execute(params![edge.from_entity, edge.to_entity, rt])?;
+            }
         }
 
+        set_cache_kind(&tx, CACHE_KIND_FULL)?;
+        set_cache_source_scope(&tx, source_scope)?;
         tx.commit()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_cache_root() -> &'static Path {
+        static CACHE_ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+        CACHE_ROOT
+            .get_or_init(|| {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let root = std::env::temp_dir()
+                    .join(format!("sem-mcp-test-cache-{}-{nanos}", std::process::id()));
+                std::fs::create_dir_all(&root).unwrap();
+                root
+            })
+            .as_path()
+    }
+
+    fn configure_test_cache_root() {
+        std::env::set_var("SEM_CACHE_DIR", test_cache_root());
+    }
+
+    fn temp_repo_root(test_name: &str) -> std::path::PathBuf {
+        configure_test_cache_root();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "sem-mcp-cache-{test_name}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        std::fs::write(path, content).unwrap();
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "tester")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "tester")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn commit_py(dir: &Path, content: &str, msg: &str) {
+        write_file(&dir.join("main.py"), content);
+        run_git(dir, &["add", "."]);
+        run_git(dir, &["commit", "-m", msg, "--no-gpg-sign"]);
+    }
+
+    #[test]
+    fn semantic_commit_index_matches_live_walk_and_is_incremental() {
+        let root = temp_repo_root("commit-index");
+        run_git(&root, &["init", "-q"]);
+        commit_py(
+            &root,
+            "def alpha():\n    return 1\n\ndef beta():\n    return 2\n",
+            "c1",
+        );
+        commit_py(
+            &root,
+            "def alpha():\n    return 10\n\ndef beta():\n    return 20\n",
+            "c2",
+        );
+        commit_py(
+            &root,
+            "def alpha():\n    return 100\n\ndef beta():\n    return 20\n",
+            "c3",
+        );
+
+        let git_bridge = GitBridge::open(&root).unwrap();
+        let registry = sem_core::parser::plugins::create_default_registry();
+
+        let live =
+            sem_core::parser::hotspot::compute_history_analytics(&git_bridge, &registry, None, 50);
+        let stored = history_analytics_from_store(&root, &git_bridge, &registry, None, 50)
+            .expect("store-backed analytics");
+
+        assert_eq!(stored.commits_scanned, live.commits_scanned);
+        assert_eq!(stored.hotspots.len(), live.hotspots.len());
+        for (s, l) in stored.hotspots.iter().zip(live.hotspots.iter()) {
+            assert_eq!(
+                (
+                    s.entity_name.as_str(),
+                    s.commits,
+                    s.authors,
+                    s.last_short_sha.as_str()
+                ),
+                (
+                    l.entity_name.as_str(),
+                    l.commits,
+                    l.authors,
+                    l.last_short_sha.as_str()
+                )
+            );
+        }
+        assert_eq!(stored.co_changes.len(), live.co_changes.len());
+
+        // A second query indexes nothing new.
+        let commits = git_bridge.get_log(50).unwrap();
+        let mut cache = DiskCache::open(&root).unwrap();
+        assert_eq!(
+            cache
+                .index_commits(&git_bridge, &registry, &commits[..commits.len() - 1])
+                .unwrap(),
+            0
+        );
+
+        // A new commit indexes exactly one more.
+        commit_py(
+            &root,
+            "def alpha():\n    return 1000\n\ndef beta():\n    return 20\n",
+            "c4",
+        );
+        let commits = git_bridge.get_log(50).unwrap();
+        assert_eq!(
+            cache
+                .index_commits(&git_bridge, &registry, &commits[..commits.len() - 1])
+                .unwrap(),
+            1
+        );
+        drop(cache);
+
+        let stored2 =
+            history_analytics_from_store(&root, &git_bridge, &registry, None, 50).unwrap();
+        let alpha = stored2
+            .hotspots
+            .iter()
+            .find(|h| h.entity_name == "alpha")
+            .expect("alpha hotspot");
+        assert_eq!(alpha.commits, 3); // c2, c3, c4
+    }
+
+    fn empty_graph() -> EntityGraph {
+        EntityGraph::from_parts(EntityInfoMap::default(), Vec::new())
+    }
+
+    fn entity(id: &str, file_path: &str, name: &str, content: &str) -> SemanticEntity {
+        SemanticEntity {
+            id: id.to_string(),
+            file_path: file_path.to_string(),
+            entity_type: "function".to_string(),
+            name: name.to_string(),
+            parent_id: None,
+            content: content.to_string(),
+            content_hash: format!("hash:{content}"),
+            structural_hash: None,
+            start_line: 1,
+            end_line: 1,
+            start_byte: None,
+            end_byte: None,
+            metadata: None,
+        }
+    }
+
+    fn entity_content(cache: &DiskCache, id: &str) -> Option<String> {
+        let mut stmt = cache
+            .conn
+            .prepare("SELECT content FROM entities WHERE id = ?1")
+            .unwrap();
+        let mut rows = stmt.query(rusqlite::params![id]).unwrap();
+        rows.next().unwrap().map(|row| row.get(0).unwrap())
+    }
+
+    fn entity_info(id: &str, file_path: &str, name: &str) -> EntityInfo {
+        EntityInfo {
+            id: id.to_string(),
+            file_path: file_path.to_string(),
+            entity_type: "function".to_string(),
+            name: name.to_string(),
+            parent_id: None,
+            start_line: 1,
+            end_line: 1,
+        }
+    }
+
+    fn graph_with_edges(entities: &[SemanticEntity], edges: Vec<EntityRef>) -> EntityGraph {
+        let entity_map: EntityInfoMap = entities
+            .iter()
+            .map(|entity| {
+                (
+                    entity.id.clone(),
+                    entity_info(&entity.id, &entity.file_path, &entity.name),
+                )
+            })
+            .collect();
+        EntityGraph::from_parts(entity_map, edges)
+    }
+
+    fn edge(from_entity: &str, to_entity: &str) -> EntityRef {
+        EntityRef {
+            from_entity: from_entity.to_string(),
+            to_entity: to_entity.to_string(),
+            ref_type: RefType::Calls,
+        }
+    }
+
+    fn edge_count(cache: &DiskCache, from_entity: &str, to_entity: &str) -> i64 {
+        cache
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE from_entity = ?1 AND to_entity = ?2",
+                rusqlite::params![from_entity, to_entity],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn file_import_count(cache: &DiskCache, importing_file: &str, imported_file: &str) -> i64 {
+        cache
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_imports WHERE importing_file = ?1 AND imported_file = ?2",
+                rusqlite::params![importing_file, imported_file],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn cached_file_mtime(cache: &DiskCache, file: &str) -> (i64, i64) {
+        cache
+            .conn
+            .query_row(
+                "SELECT mtime_secs, mtime_nanos FROM files WHERE path = ?1",
+                rusqlite::params![file],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn sample_files(root: &Path) -> Vec<String> {
+        write_file(&root.join("sample.foo"), "export const alpha = () => 1;\n");
+        vec!["sample.foo".to_string()]
+    }
+
+    #[test]
+    fn content_store_round_trip_is_byte_identical() {
+        let root = temp_repo_root("content-store-roundtrip");
+        // A real source file so the extractor assigns byte spans, including a
+        // multi-byte character to stress slicing, plus a nested class so the
+        // 2x duplication case (class contains method) is exercised.
+        let src = "class Greeter:\n    def hello(self):\n        return \"h\u{00e9}llo\"\n\n\ndef standalone():\n    return 1\n";
+        std::fs::write(root.join("app.py"), src).unwrap();
+
+        let registry = sem_core::parser::plugins::create_default_registry();
+        let files = vec!["app.py".to_string()];
+        let (graph, entities) =
+            sem_core::parser::graph::EntityGraph::build(&root, &files, &registry);
+        assert!(!entities.is_empty());
+        let spanned = entities.iter().filter(|e| e.start_byte.is_some()).count();
+        assert!(spanned > 0, "extractor should assign byte spans");
+
+        let cache = DiskCache::open(&root).unwrap();
+        cache
+            .save(&root, &files, &graph, &entities, CacheSourceScope::Default)
+            .unwrap();
+
+        // The store must actually engage: at least one row holds NULL content
+        // and the file text landed in file_contents.
+        let null_rows: i64 = cache
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE content IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(null_rows > 0, "no entity used the content store");
+        let stored_files: i64 = cache
+            .conn
+            .query_row("SELECT COUNT(*) FROM file_contents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored_files, 1);
+
+        // Round trip: every entity's content byte-identical after load.
+        let (_, loaded) = cache
+            .load_with_source_scope(&root, &files, CacheSourceScope::Default)
+            .expect("cache should load");
+        assert_eq!(loaded.len(), entities.len());
+        let by_id: HashMap<&str, &SemanticEntity> =
+            entities.iter().map(|e| (e.id.as_str(), e)).collect();
+        for l in &loaded {
+            let orig = by_id.get(l.id.as_str()).expect("entity survived");
+            assert_eq!(
+                l.content, orig.content,
+                "content mismatch for {} after round trip",
+                l.id
+            );
+        }
+        cleanup(root);
+    }
+
+    fn cleanup(root: std::path::PathBuf) {
+        let _ = std::fs::remove_dir_all(&root);
+        if let Some(cache_dir) = cache_dir_for_repo(&root) {
+            let _ = std::fs::remove_dir_all(cache_dir);
+        }
+    }
+
+    fn save_empty_cache(root: &Path, files: &[String]) -> DiskCache {
+        let cache = DiskCache::open(root).unwrap();
+        cache
+            .save(root, files, &empty_graph(), &[], CacheSourceScope::Default)
+            .unwrap();
+        assert!(cache.load(root, files).is_some());
+        cache
+    }
+
+    #[test]
+    fn refresh_file_fingerprints_rolls_back_batch_on_failure() {
+        let root = temp_repo_root("mtime-refresh-rollback");
+        write_file(&root.join("a.rs"), "fn a() {}\n");
+        write_file(&root.join("b.rs"), "fn b() {}\n");
+        let files = vec!["a.rs".to_string(), "b.rs".to_string()];
+        let cache = save_empty_cache(&root, &files);
+        let before_a = cached_file_mtime(&cache, "a.rs");
+        let before_b = cached_file_mtime(&cache, "b.rs");
+
+        cache
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_b_refresh
+                 BEFORE UPDATE ON files
+                 WHEN OLD.path = 'b.rs'
+                 BEGIN
+                     SELECT RAISE(FAIL, 'stop refresh');
+                 END;",
+            )
+            .unwrap();
+
+        let err = refresh_file_fingerprints(
+            &cache.conn,
+            &[
+                FileFingerprintRefresh {
+                    path: "a.rs".to_string(),
+                    mtime_secs: before_a.0 + 1,
+                    mtime_nanos: before_a.1,
+                    content_hash: "updated-a".to_string(),
+                },
+                FileFingerprintRefresh {
+                    path: "b.rs".to_string(),
+                    mtime_secs: before_b.0 + 1,
+                    mtime_nanos: before_b.1,
+                    content_hash: "updated-b".to_string(),
+                },
+            ],
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("stop refresh"));
+        assert_eq!(cached_file_mtime(&cache, "a.rs"), before_a);
+        assert_eq!(cached_file_mtime(&cache, "b.rs"), before_b);
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn partial_cache_reports_clean_files_that_import_stale_js_ts_files() {
+        let root = temp_repo_root("incremental-import-metadata");
+        write_file(
+            &root.join("a.ts"),
+            "import { target } from './b';\nexport function useIt() { return target(); }\n",
+        );
+        write_file(
+            &root.join("b.ts"),
+            "export function target() { return 1; }\n",
+        );
+        write_file(
+            &root.join("c.ts"),
+            "export function other() { return 2; }\n",
+        );
+        let files = vec!["a.ts".to_string(), "b.ts".to_string(), "c.ts".to_string()];
+        let cache = DiskCache::open(&root).unwrap();
+        cache
+            .save(
+                &root,
+                &files,
+                &empty_graph(),
+                &[],
+                CacheSourceScope::Default,
+            )
+            .unwrap();
+
+        assert_eq!(file_import_count(&cache, "a.ts", "b.ts"), 1);
+
+        rewrite_after_mtime_tick(
+            &root.join("b.ts"),
+            "export function target() { return 3; }\n",
+        );
+        rewrite_after_mtime_tick(
+            &root.join("c.ts"),
+            "export function other() { return 2; }\n",
+        );
+        let current_c = file_mtime_parts(&root.join("c.ts")).unwrap();
+        let partial = cache.load_partial(&root, &files).unwrap();
+        assert_eq!(partial.stale_files, vec!["b.ts"]);
+        assert_eq!(partial.cached_importing_stale_files, vec!["a.ts"]);
+        assert_eq!(cached_file_mtime(&cache, "c.ts"), current_c);
+
+        rewrite_after_mtime_tick(
+            &root.join("a.ts"),
+            "import { other } from './c';\nexport function useIt() { return other(); }\n",
+        );
+        cache
+            .save_incremental_with_repair_metadata(
+                &root,
+                &files,
+                &["a.ts".to_string()],
+                &empty_graph(),
+                &[],
+                false,
+                &[],
+                &[],
+                CacheSourceScope::Default,
+            )
+            .unwrap();
+        assert_eq!(file_import_count(&cache, "a.ts", "b.ts"), 0);
+        assert_eq!(file_import_count(&cache, "a.ts", "c.ts"), 1);
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    fn rewrite_after_mtime_tick(path: &Path, content: &str) {
+        let before = file_mtime_parts(path).unwrap();
+
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            write_file(path, content);
+            if file_mtime_parts(path).unwrap() != before {
+                return;
+            }
+        }
+
+        panic!("mtime did not change for {}", path.display());
+    }
+
+    #[test]
+    fn cache_reuse_requires_matching_source_scope_and_incremental_preserves_it() {
+        let root = temp_repo_root("source-scope-cache-reuse");
+        write_file(&root.join("a.ts"), "export function a() { return 1; }\n");
+        write_file(&root.join("b.ts"), "export function b() { return a(); }\n");
+        let files = vec!["a.ts".to_string(), "b.ts".to_string()];
+        let entities = vec![
+            entity("a-id", "a.ts", "a", "export function a() { return 1; }"),
+            entity("b-id", "b.ts", "b", "export function b() { return a(); }"),
+        ];
+        let graph = graph_with_edges(&entities, vec![edge("b-id", "a-id")]);
+        let cache = DiskCache::open(&root).unwrap();
+
+        cache
+            .save(&root, &files, &graph, &entities, CacheSourceScope::Custom)
+            .unwrap();
+
+        assert!(cache
+            .load_with_source_scope(&root, &files, CacheSourceScope::Default)
+            .is_none());
+        assert!(cache
+            .load_with_source_scope(&root, &files, CacheSourceScope::Custom)
+            .is_some());
+        assert!(cache
+            .load_partial_with_source_scope(&root, &files, CacheSourceScope::Default)
+            .is_none());
+
+        rewrite_after_mtime_tick(&root.join("b.ts"), "export function b() { return 2; }\n");
+        let partial = cache
+            .load_partial_with_source_scope(&root, &files, CacheSourceScope::Custom)
+            .unwrap();
+        assert_eq!(partial.stale_files, vec!["b.ts"]);
+
+        let updated_entities = vec![
+            entity("a-id", "a.ts", "a", "export function a() { return 1; }"),
+            entity("b-id", "b.ts", "b", "export function b() { return 2; }"),
+        ];
+        let updated_graph = graph_with_edges(&updated_entities, vec![]);
+        cache
+            .save_incremental_with_repair_metadata(
+                &root,
+                &files,
+                &partial.stale_files,
+                &updated_graph,
+                &updated_entities,
+                false,
+                &["b-id".to_string()],
+                &[],
+                CacheSourceScope::Custom,
+            )
+            .unwrap();
+
+        assert!(cache
+            .load_with_source_scope(&root, &files, CacheSourceScope::Default)
+            .is_none());
+        assert!(cache
+            .load_with_source_scope(&root, &files, CacheSourceScope::Custom)
+            .is_some());
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    fn read_user_version(cache: &DiskCache) -> i32 {
+        cache
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn assert_lookup_indexes(cache: &DiskCache) {
+        let mut stmt = cache
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'index' AND name NOT LIKE 'sqlite_autoindex%'
+                 ORDER BY name",
+            )
+            .unwrap();
+        let indexes: HashSet<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|result| result.unwrap())
+            .collect();
+
+        for (expected, _, _) in CACHE_INDEXES {
+            assert!(indexes.contains(*expected), "missing index {expected}");
+        }
+    }
+
+    fn assert_table_empty(cache: &DiskCache, table: &str) {
+        let sql = format!("SELECT COUNT(*) FROM {table}");
+        let count: i64 = cache.conn.query_row(&sql, [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0, "{table} should be empty after schema rebuild");
+    }
+
+    fn seed_unsupported_cache(root: &Path, version: i32) {
+        let cache_dir = cache_dir_for_repo(root).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let db_path = cache_dir.join("cache.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA user_version = {version};
+             CREATE TABLE files (
+                 path TEXT PRIMARY KEY,
+                 mtime_secs INTEGER NOT NULL,
+                 mtime_nanos INTEGER NOT NULL
+             );
+             CREATE TABLE entities (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 entity_type TEXT NOT NULL,
+                 file_path TEXT NOT NULL,
+                 start_line INTEGER NOT NULL,
+                 end_line INTEGER NOT NULL,
+                 content TEXT NOT NULL,
+                 content_hash TEXT NOT NULL,
+                 structural_hash TEXT,
+                 parent_id TEXT,
+                 metadata_json TEXT
+             );
+             CREATE TABLE edges (
+                 from_entity TEXT NOT NULL,
+                 to_entity TEXT NOT NULL,
+                 ref_type TEXT NOT NULL
+             );
+             INSERT INTO files (path, mtime_secs, mtime_nanos)
+             VALUES ('stale.rs', 1, 2);
+             INSERT INTO entities (
+                 id, name, entity_type, file_path, start_line, end_line,
+                 content, content_hash, structural_hash, parent_id, metadata_json
+             )
+             VALUES (
+                 'stale-id', 'stale', 'function', 'stale.rs', 1, 1,
+                 'fn stale() {{}}', 'old-content', NULL, NULL, NULL
+             );
+             INSERT INTO edges (from_entity, to_entity, ref_type)
+             VALUES ('stale-id', 'other-id', 'calls');"
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn manifest_hash_tracks_gitattributes_changes() {
+        let root = temp_repo_root("gitattributes-manifest-hash");
+        let files = sample_files(&root);
+        let gitattributes = root.join(".gitattributes");
+
+        let without_gitattributes = compute_manifest_hash(&root, &files).unwrap();
+
+        write_file(&gitattributes, "*.foo linguist-language=javascript\n");
+        let with_gitattributes = compute_manifest_hash(&root, &files).unwrap();
+        assert_ne!(without_gitattributes, with_gitattributes);
+
+        rewrite_after_mtime_tick(&gitattributes, "*.foo linguist-language=typescript\n");
+        let modified_gitattributes = compute_manifest_hash(&root, &files).unwrap();
+        assert_ne!(with_gitattributes, modified_gitattributes);
+
+        std::fs::remove_file(&gitattributes).unwrap();
+        let removed_gitattributes = compute_manifest_hash(&root, &files).unwrap();
+        assert_eq!(without_gitattributes, removed_gitattributes);
+
+        cleanup(root);
+    }
+
+    #[test]
+    fn load_refreshes_mtime_when_file_content_is_unchanged() {
+        let root = temp_repo_root("mtime-only-refresh");
+        let file_contents = [
+            ("same_a.rs", "fn same_a() {}\n"),
+            ("same_b.rs", "fn same_b() {}\n"),
+            ("same_c.rs", "fn same_c() {}\n"),
+        ];
+        for (file, content) in &file_contents {
+            write_file(&root.join(*file), content);
+        }
+        let files: Vec<String> = file_contents
+            .iter()
+            .map(|(file, _)| (*file).to_string())
+            .collect();
+        let cache = save_empty_cache(&root, &files);
+        let before: Vec<(i64, i64)> = files
+            .iter()
+            .map(|file| cached_file_mtime(&cache, file))
+            .collect();
+
+        let rewrite_all = || -> Vec<(i64, i64)> {
+            for (file, content) in &file_contents {
+                rewrite_after_mtime_tick(&root.join(*file), content);
+            }
+            file_contents
+                .iter()
+                .map(|(file, _)| file_mtime_parts(&root.join(*file)).unwrap())
+                .collect()
+        };
+        let assert_cached_mtimes = |expected: &[(i64, i64)]| {
+            for (file, expected) in files.iter().zip(expected) {
+                assert_eq!(cached_file_mtime(&cache, file), *expected);
+            }
+        };
+
+        let full_current = rewrite_all();
+        assert!(before
+            .iter()
+            .zip(&full_current)
+            .all(|(before, current)| before != current));
+        assert!(cache.load(&root, &files).is_some());
+        assert_cached_mtimes(&full_current);
+
+        let topology_current = rewrite_all();
+        assert!(cache.load_graph_topology(&root, &files).is_some());
+        assert_cached_mtimes(&topology_current);
+
+        let partial_current = rewrite_all();
+        assert!(cache.load_partial(&root, &files).is_none());
+        assert_cached_mtimes(&partial_current);
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn cache_loads_ignore_fingerprint_refresh_failure() {
+        let root = temp_repo_root("refresh-failure-cache-hit");
+        write_file(&root.join("same.rs"), "fn same() {}\n");
+        write_file(&root.join("stale.rs"), "fn stale() {}\n");
+        let files = vec!["same.rs".to_string(), "stale.rs".to_string()];
+        let cache = save_empty_cache(&root, &files);
+        let before_same = cached_file_mtime(&cache, "same.rs");
+
+        cache
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_fingerprint_refresh
+                 BEFORE UPDATE ON files
+                 BEGIN
+                     SELECT RAISE(FAIL, 'stop refresh');
+                 END;",
+            )
+            .unwrap();
+
+        rewrite_after_mtime_tick(&root.join("same.rs"), "fn same() {}\n");
+        assert!(cache.load(&root, &files).is_some());
+        assert!(cache.load_graph_topology(&root, &files).is_some());
+        assert_eq!(cached_file_mtime(&cache, "same.rs"), before_same);
+
+        rewrite_after_mtime_tick(&root.join("stale.rs"), "fn stale() { 1; }\n");
+        let partial = cache.load_partial(&root, &files).unwrap();
+        assert_eq!(partial.stale_files, vec!["stale.rs"]);
+        assert_eq!(cached_file_mtime(&cache, "same.rs"), before_same);
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn load_invalidates_when_gitattributes_is_added() {
+        let root = temp_repo_root("gitattributes-added");
+        let files = sample_files(&root);
+        let cache = save_empty_cache(&root, &files);
+
+        write_file(
+            &root.join(".gitattributes"),
+            "*.foo linguist-language=javascript\n",
+        );
+
+        assert!(cache.load(&root, &files).is_none());
+        assert!(cache.load_partial(&root, &files).is_none());
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn load_invalidates_when_gitattributes_is_modified() {
+        let root = temp_repo_root("gitattributes-modified");
+        let files = sample_files(&root);
+        let gitattributes = root.join(".gitattributes");
+        write_file(&gitattributes, "*.foo linguist-language=javascript\n");
+        let cache = save_empty_cache(&root, &files);
+
+        rewrite_after_mtime_tick(&gitattributes, "*.foo linguist-language=typescript\n");
+
+        assert!(cache.load(&root, &files).is_none());
+        assert!(cache.load_partial(&root, &files).is_none());
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn load_invalidates_when_gitattributes_is_removed() {
+        let root = temp_repo_root("gitattributes-removed");
+        let files = sample_files(&root);
+        let gitattributes = root.join(".gitattributes");
+        write_file(&gitattributes, "*.foo linguist-language=javascript\n");
+        let cache = save_empty_cache(&root, &files);
+
+        std::fs::remove_file(&gitattributes).unwrap();
+
+        assert!(cache.load(&root, &files).is_none());
+        assert!(cache.load_partial(&root, &files).is_none());
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn save_incremental_keeps_clean_entity_rows_without_clean_id_repair() {
+        let root = temp_repo_root("incremental-entities");
+        write_file(&root.join("stale.rs"), "fn stale() {}\n");
+        write_file(&root.join("clean.rs"), "fn clean() {}\n");
+        let files = vec!["stale.rs".to_string(), "clean.rs".to_string()];
+        let cache = DiskCache::open(&root).unwrap();
+        cache
+            .save(
+                &root,
+                &files,
+                &empty_graph(),
+                &[
+                    entity("stale-id", "stale.rs", "stale", "stale old"),
+                    entity("clean-id", "clean.rs", "clean", "clean old"),
+                ],
+                CacheSourceScope::Default,
+            )
+            .unwrap();
+
+        let entities = vec![
+            entity("stale-id", "stale.rs", "stale", "stale new"),
+            entity("clean-id", "clean.rs", "clean", "clean should stay cached"),
+        ];
+        cache
+            .save_incremental(
+                &root,
+                &files,
+                &["stale.rs".to_string()],
+                &empty_graph(),
+                &entities,
+                CacheSourceScope::Default,
+            )
+            .unwrap();
+
+        assert_eq!(
+            entity_content(&cache, "stale-id"),
+            Some("stale new".to_string())
+        );
+        assert_eq!(
+            entity_content(&cache, "clean-id"),
+            Some("clean old".to_string())
+        );
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn save_incremental_wrapper_rewrites_stale_source_edges() {
+        let root = temp_repo_root("incremental-wrapper-edges");
+        write_file(&root.join("stale.rs"), "fn stale() {}\n");
+        write_file(&root.join("clean.rs"), "fn clean() {}\n");
+        write_file(&root.join("old.rs"), "fn old_target() {}\n");
+        write_file(&root.join("new.rs"), "fn new_target() {}\n");
+        let files = vec![
+            "stale.rs".to_string(),
+            "clean.rs".to_string(),
+            "old.rs".to_string(),
+            "new.rs".to_string(),
+        ];
+        let cache = DiskCache::open(&root).unwrap();
+        let entities = vec![
+            entity("stale-id", "stale.rs", "stale", "stale old"),
+            entity("clean-id", "clean.rs", "clean", "clean old"),
+            entity("old-target-id", "old.rs", "old_target", "old target"),
+            entity("new-target-id", "new.rs", "new_target", "new target"),
+        ];
+        let initial_graph = graph_with_edges(
+            &entities,
+            vec![
+                edge("stale-id", "old-target-id"),
+                edge("clean-id", "old-target-id"),
+            ],
+        );
+        cache
+            .save(
+                &root,
+                &files,
+                &initial_graph,
+                &entities,
+                CacheSourceScope::Default,
+            )
+            .unwrap();
+
+        let updated_entities = vec![
+            entity("stale-id", "stale.rs", "stale", "stale new"),
+            entity("clean-id", "clean.rs", "clean", "clean should stay cached"),
+            entity("old-target-id", "old.rs", "old_target", "old target"),
+            entity("new-target-id", "new.rs", "new_target", "new target"),
+        ];
+        let updated_graph = graph_with_edges(
+            &updated_entities,
+            vec![
+                edge("stale-id", "new-target-id"),
+                edge("clean-id", "old-target-id"),
+            ],
+        );
+        cache
+            .save_incremental(
+                &root,
+                &files,
+                &["stale.rs".to_string()],
+                &updated_graph,
+                &updated_entities,
+                CacheSourceScope::Default,
+            )
+            .unwrap();
+
+        assert_eq!(edge_count(&cache, "stale-id", "old-target-id"), 0);
+        assert_eq!(edge_count(&cache, "stale-id", "new-target-id"), 1);
+        assert_eq!(edge_count(&cache, "clean-id", "old-target-id"), 1);
+        assert_eq!(
+            entity_content(&cache, "clean-id"),
+            Some("clean old".to_string())
+        );
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn save_incremental_rewrites_entities_after_clean_id_repair() {
+        let root = temp_repo_root("incremental-clean-repair");
+        write_file(&root.join("stale.rs"), "fn stale() {}\n");
+        write_file(&root.join("clean.rs"), "fn clean() {}\n");
+        let files = vec!["stale.rs".to_string(), "clean.rs".to_string()];
+        let cache = DiskCache::open(&root).unwrap();
+        cache
+            .save(
+                &root,
+                &files,
+                &empty_graph(),
+                &[
+                    entity("stale-id", "stale.rs", "stale", "stale old"),
+                    entity("clean-old-id", "clean.rs", "clean", "clean old"),
+                ],
+                CacheSourceScope::Default,
+            )
+            .unwrap();
+
+        let entities = vec![
+            entity("stale-id", "stale.rs", "stale", "stale new"),
+            entity("clean-new-id", "clean.rs", "clean", "clean repaired"),
+        ];
+        cache
+            .save_incremental_with_repair_metadata(
+                &root,
+                &files,
+                &["stale.rs".to_string()],
+                &empty_graph(),
+                &entities,
+                true,
+                &[],
+                &[],
+                CacheSourceScope::Default,
+            )
+            .unwrap();
+
+        assert_eq!(entity_content(&cache, "clean-old-id"), None);
+        assert_eq!(
+            entity_content(&cache, "clean-new-id"),
+            Some("clean repaired".to_string())
+        );
+        assert_eq!(
+            entity_content(&cache, "stale-id"),
+            Some("stale new".to_string())
+        );
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn open_creates_schema_version_and_lookup_indexes() {
+        let root = temp_repo_root("schema");
+        let cache = DiskCache::open(&root).unwrap();
+
+        assert_eq!(read_user_version(&cache), CACHE_SCHEMA_VERSION);
+        assert_lookup_indexes(&cache);
+        assert!(cache_db_path(&root).unwrap().exists());
+        assert!(!root.join(".sem").exists());
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn create_cache_dir_preserves_directory_creation_error() {
+        let blocked = std::env::temp_dir().join(format!(
+            "sem-mcp-cache-blocked-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&blocked, "not a directory").unwrap();
+        let cache_dir = blocked.join("child");
+
+        let err = create_cache_dir(&cache_dir).unwrap_err();
+
+        match err {
+            rusqlite::Error::SqliteFailure(sqlite_error, Some(message)) => {
+                assert_eq!(sqlite_error.code, rusqlite::ErrorCode::CannotOpen);
+                assert!(message.contains("failed to create cache directory"));
+                assert!(message.contains(&cache_dir.display().to_string()));
+            }
+            other => panic!("expected preserved directory creation error, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(blocked);
+    }
+
+    #[test]
+    fn cache_path_is_external_and_canonicalized() {
+        let root = temp_repo_root("external-path");
+        let cache_dir = cache_dir_for_repo(&root).unwrap();
+
+        assert_eq!(cache_dir, cache_dir_for_repo(&root.join(".")).unwrap());
+        assert!(!cache_dir.starts_with(&root));
+
+        let cache = DiskCache::open(&root).unwrap();
+        assert!(cache_db_path(&root).unwrap().exists());
+        assert!(!root.join(".sem").exists());
+
+        drop(cache);
+        cleanup(root);
+    }
+
+    #[test]
+    fn open_rebuilds_cache_when_schema_version_is_unsupported() {
+        for version in [0, CACHE_SCHEMA_VERSION - 1, CACHE_SCHEMA_VERSION + 1] {
+            let root = temp_repo_root(&format!("unsupported-{version}"));
+            seed_unsupported_cache(&root, version);
+
+            let cache = DiskCache::open(&root).unwrap();
+
+            assert_eq!(read_user_version(&cache), CACHE_SCHEMA_VERSION);
+            assert_lookup_indexes(&cache);
+            for table in ["files", "entities", "edges"] {
+                assert_table_empty(&cache, table);
+            }
+
+            drop(cache);
+            cleanup(root);
+        }
     }
 }

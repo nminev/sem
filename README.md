@@ -9,6 +9,10 @@
 </p>
 
 <p align="center">
+  <a href="https://trendshift.io/repositories/25348" target="_blank"><img src="https://trendshift.io/api/badge/repositories/25348" alt="Ataraxy-Labs%2Fsem | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+</p>
+
+<p align="center">
   <strong>Semantic version control built on Git.</strong><br>
   Instead of lines changed, sem tells you what entities changed: functions, methods, classes.
 </p>
@@ -17,7 +21,8 @@
   <a href="https://ataraxy-labs.com/blogs/code-is-not-text">Why sem?</a> ·
   <a href="#install">Install</a> ·
   <a href="#commands">Commands</a> ·
-  <a href="#mcp-server">MCP Server</a> ·
+  <a href="#use-with-ai-agents-mcp">Agents (MCP)</a> ·
+  <a href="docs/cloud-consent.html">Cloud consent</a> ·
   <a href="https://github.com/Ataraxy-Labs/sem/releases/latest">Releases</a>
 </p>
 
@@ -26,12 +31,14 @@
   <img src="https://img.shields.io/badge/rust-stable-orange" alt="Rust">
   <img src="https://img.shields.io/badge/tests-133_passing-brightgreen" alt="Tests">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-yellow" alt="License"></a>
-  <img src="https://img.shields.io/badge/languages-26-blue" alt="Languages">
+  <img src="https://img.shields.io/badge/languages-31-blue" alt="Languages">
 </p>
 
 sem is a semantic version control tool that works on top of Git. It parses your code with tree-sitter, extracts every function, class, and method as an entity, and diffs at the entity level instead of lines. This means you see "function `blahh` was modified" instead of "lines x-y changed."
 
 It works in any Git repo with no setup.
+
+Cloud-backed queries are opt-in per repo: logging in does not upload a repo or send a query. See the [cloud consent flow](docs/cloud-consent.html) for the public/private repo states, preview screen, local audit log, and forget controls.
 
 <p align="center">
   <img src="assets/terminal.svg" alt="sem diff" width="800" />
@@ -40,7 +47,19 @@ It works in any Git repo with no setup.
 ## Install
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/Ataraxy-Labs/sem/main/install.sh | sh
+```
+
+Or via Homebrew:
+
+```bash
 brew install sem-cli
+```
+
+Or via winget on Windows:
+
+```powershell
+winget install AtaraxyLabs.sem
 ```
 
 Or install the npm wrapper into `node_modules`:
@@ -56,12 +75,16 @@ bun add -d @ataraxy-labs/sem
 bun pm trust @ataraxy-labs/sem
 ```
 
+Once installed, update to the latest release any time:
+
+```bash
+sem update
+```
+
 Or build from source (requires Rust):
 
 ```bash
-git clone https://github.com/Ataraxy-Labs/sem
-cd sem/crates
-cargo install --path sem-cli
+cargo install --git https://github.com/Ataraxy-Labs/sem sem-cli
 ```
 
 Or grab a binary from [GitHub Releases](https://github.com/Ataraxy-Labs/sem/releases).
@@ -95,6 +118,8 @@ If you installed via npm/bun, the binary lives in `node_modules/.bin/sem` and is
 ## Commands
 
 Works in any Git repo. No setup required. Also works outside Git for arbitrary file comparison.
+
+sem stores its SQLite entity cache outside the repository, under the OS cache directory by default. Set `SEM_CACHE_DIR=/path/to/cache` to override the cache root; repo-local overrides are ignored so cache files do not dirty the working tree.
 
 ### sem diff
 
@@ -158,6 +183,9 @@ sem impact authenticateUser --json
 
 # Disambiguate by file
 sem impact authenticateUser --file src/auth.ts
+
+# Include default-excluded paths such as generated, fixture, vendor, benchmark, and build trees
+sem impact authenticateUser --no-default-excludes
 ```
 
 ### sem blame
@@ -188,6 +216,18 @@ sem log authenticateUser --limit 20
 sem log authenticateUser --json
 ```
 
+With no entity, `sem log` analyzes recent repo history at the entity level:
+**hotspots** (most-changed functions/classes, with author counts) and
+**co-change pairs** (entities that repeatedly change in the same commits —
+"if you touch one, don't forget the other"):
+
+```bash
+sem log                 # repo hotspots + co-change pairs (last 50 commits)
+sem log --limit 200     # deeper history
+sem log --file src/auth.ts   # scoped to one file
+sem log --json          # full data
+```
+
 ### sem entities
 
 List all entities under a file or directory path. No path is the same as `.`.
@@ -202,11 +242,15 @@ sem entities src/auth.ts
 # JSON output
 sem entities --json
 sem entities src/auth.ts --json
+
+# Include default-excluded paths such as generated, fixture, vendor, benchmark, and build trees
+sem entities --no-default-excludes
 ```
 
 ### sem context
 
-Token-budgeted context for LLMs: the entity, its dependencies, and its dependents, fitted to a token budget.
+Token-budgeted context for LLMs: the entity, its dependencies, and its dependents, fitted to a strict content token budget.
+When the target signature itself does not fit, JSON output reports `target_omitted: true`.
 
 ```bash
 sem context authenticateUser
@@ -216,6 +260,9 @@ sem context authenticateUser --budget 4000
 
 # JSON output
 sem context authenticateUser --json
+
+# Include default-excluded paths such as generated, fixture, vendor, benchmark, and build trees
+sem context authenticateUser --no-default-excludes
 ```
 
 ## Use as default Git diff
@@ -228,15 +275,57 @@ sem setup
 
 Now `git diff` shows entity-level changes instead of line-level. No prompts, no agent configuration needed. Everything that calls `git diff` gets sem output automatically. Also installs a pre-commit hook that shows entity-level blast radius of staged changes.
 
-To disable and go back to normal git diff:
+On macOS and Linux, `sem setup` also wires sem into your Claude Code sessions (free, local, no login): a **warm resident graph** so structural queries answer in single-digit milliseconds instead of rebuilding each time, and **prompt-time context** so the code an agent would otherwise forage for arrives at the start of the turn. It edits `~/.claude/settings.json` idempotently, backs it up first, and leaves any hooks you already have untouched.
+
+To disable and go back to normal git diff (also removes the session hooks):
 
 ```bash
 sem unsetup
 ```
 
+## Entity-level diffs on every pull request
+
+Add the GitHub Action and every PR gets one sticky comment showing which
+functions, classes, and methods changed — updated in place on each push, and
+calling out cosmetic-only PRs (formatting/comments) explicitly:
+
+```yaml
+# .github/workflows/entity-diff.yml
+name: Entity diff
+on: pull_request
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  entity-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Ataraxy-Labs/sem/action@v0.15.1
+```
+
+No config, no API keys, never fails your build. See [action/](action/) for details.
+
+## Cloud acceleration (for scale and teams)
+
+Local is always free and, after `sem setup`, always warm — the resident graph keeps your repo hot on your own machine, so day-to-day queries are instant with no login. You do not pay to make your laptop fast.
+
+Cloud is for what a laptop can't do. On a very large monorepo the first local graph build can take a few seconds; a shared team graph shouldn't be rebuilt per developer; and CI wants the graph without checking anything out. `sem login` connects those cases to sem cloud, which keeps a warm, pre-built graph for your registered repos and serves the heavy queries from it (on a large repo like deno, an `impact` query is ~86ms from the cloud vs ~573ms rebuilt locally).
+
+```bash
+sem login                              # GitHub device flow, one time
+sem impact myFunc --file src/foo.rs    # served from the cloud's warm graph
+```
+
+It is fully optional and transparent:
+
+- Not logged in, or the cloud is unreachable? sem computes locally and prints the exact same output. No failures, no difference in results.
+- `SEM_LOCAL=1` forces local computation even when logged in.
+- Small repos see no change, local is already fast. The win is for large codebases where rebuilding the graph each time is the bottleneck.
+
 ## What it parses
 
-26 programming languages with full entity extraction via tree-sitter:
+32 programming languages with full entity extraction via tree-sitter:
 
 | Language | Extensions | Entities |
 |----------|-----------|----------|
@@ -254,6 +343,8 @@ sem unsetup
 | Swift | `.swift` | functions, classes, protocols, structs, enums, properties |
 | Elixir | `.ex` `.exs` | modules, functions, macros, guards, protocols |
 | Bash | `.sh` | functions |
+| Fish | `.fish` | functions |
+| Lua | `.lua` | functions (global, local, table, and method forms) |
 | HCL/Terraform | `.hcl` `.tf` `.tfvars` | blocks, attributes (qualified names for nested blocks) |
 | Kotlin | `.kt` `.kts` | classes, interfaces, objects, functions, properties, companion objects |
 | Fortran | `.f90` `.f95` `.f` | functions, subroutines, modules, programs |
@@ -265,7 +356,13 @@ sem unsetup
 | Dart | `.dart` | classes, mixins, extensions, enums, type aliases, functions |
 | OCaml | `.ml` `.mli` | values, modules, types, classes, externals |
 | Scala | `.scala` `.sc` `.sbt` | classes, objects, traits, enums, functions, vals, extensions |
+| Nix | `.nix` | bindings, inherit declarations |
+| Haskell | `.hs` | functions, signatures, data types, newtypes, classes, instances, type synonyms |
+| Elm | `.elm` | value declarations, type aliases, type declarations, port annotations, infix declarations |
+| Clojure | `.clj` `.cljs` `.cljc` | vars, functions, macros, multimethods, protocols, records, types |
+| D | `.d` `.di` | modules, functions, classes, structs, interfaces, unions, enums, templates, aliases, unittests |
 | Zig | `.zig` | functions, tests, variables |
+| SQL | `.sql` `.psql` `.pgsql` `.ddl` | tables, views, functions, indexes, types, schemas, triggers, sequences |
 
 Plus structured data formats:
 
@@ -274,10 +371,25 @@ Plus structured data formats:
 | JSON | `.json` | properties, objects (RFC 6901 paths) |
 | YAML | `.yml` `.yaml` | sections, properties (dot paths) |
 | TOML | `.toml` | sections, properties |
+| EDN | `.edn` | top-level map entries (keyword keys) |
 | CSV | `.csv` `.tsv` | rows (first column as identity) |
 | Markdown | `.md` `.mdx` | heading-based sections |
 
 Everything else falls back to chunk-based diffing.
+
+### Custom extensions and extensionless files
+
+For files with non-standard extensions, create a `.semrc` in your project root:
+
+```
+.xyz = cpp
+.j = json
+.mypy = python
+```
+
+sem also reads `.gitattributes` patterns (`diff=` and `linguist-language=`) if you already have those set up. `.semrc` takes priority when both define the same extension.
+
+For files with no extension at all, sem detects the language automatically from content (imports, declarations, shebang lines, vim modelines). This covers 19 languages with no config needed.
 
 ## How matching works
 
@@ -289,26 +401,40 @@ Three-phase entity matching:
 
 This means sem detects renames and moves, not just additions and deletions. Structural hashing also distinguishes cosmetic changes (whitespace, formatting) from real logic changes.
 
-## MCP Server
+## Use with AI agents (MCP)
 
-sem includes an MCP server with 6 tools for AI agents: `sem_entities`, `sem_diff`, `sem_blame`, `sem_impact`, `sem_log`, `sem_context`. These mirror the CLI commands exactly.
+`sem mcp` starts a [Model Context Protocol](https://modelcontextprotocol.io) server over stdin/stdout. It's not a command you run and read yourself: it's a server your coding agent launches in the background so it can ask sem questions while it works. That's the reason `mcp` lives alongside the normal commands. The agent gets 6 tools, all entity-level: `sem_impact`, `sem_context`, `sem_diff`, `sem_entities`, `sem_blame`, `sem_log`.
+
+Why an agent wants these: instead of reading whole files and burning tokens, it can ask "what breaks if I change `submitOrder`" (`sem_impact`) or "give me just the context to refactor this function" (`sem_context`) and get a precise answer from the dependency graph.
+
+Add it once, then talk to your agent normally. It calls the tools on its own.
+
+**Claude Code:**
+
+```bash
+claude mcp add sem -- sem mcp
+```
+
+Or one command that also installs the skill, so the agent knows *when* to reach for sem:
+
+```bash
+npx @ataraxy-labs/sem-skill
+```
+
+**Cursor, Claude Desktop, or any client with an `mcpServers` config:**
 
 ```json
 {
   "mcpServers": {
     "sem": {
-      "command": "sem-mcp"
+      "command": "sem",
+      "args": ["mcp"]
     }
   }
 }
 ```
 
-Install the MCP binary:
-
-```bash
-cd sem/crates
-cargo install --path sem-mcp
-```
+If `sem` isn't on the agent's PATH, use the absolute path to the binary. No separate install is needed: `sem mcp` ships in the same binary as every other command.
 
 ## JSON output
 
@@ -323,6 +449,11 @@ sem diff --format json
     "added": 1,
     "modified": 1,
     "deleted": 1,
+    "moved": 0,
+    "renamed": 0,
+    "reordered": 0,
+    "binary": 0,
+    "orphan": 0,
     "total": 3
   },
   "changes": [
@@ -331,11 +462,18 @@ sem diff --format json
       "changeType": "added",
       "entityType": "function",
       "entityName": "validateToken",
+      "startLine": 12,
+      "endLine": 18,
+      "oldStartLine": null,
+      "oldEndLine": null,
       "filePath": "src/auth.ts"
     }
-  ]
+  ],
+  "binaryChanges": []
 }
 ```
+
+The named change-type buckets (`added`, `modified`, `deleted`, `moved`, `renamed`, `reordered`) always sum to `total`. `orphan` is a cross-cutting metadata count for module-level changes, and those changes are already included in the named change-type buckets.
 
 ## As a library
 
@@ -343,7 +481,7 @@ sem-core can be used as a Rust library dependency:
 
 ```toml
 [dependencies]
-sem-core = { git = "https://github.com/Ataraxy-Labs/sem", version = "0.4" }
+sem-core = { git = "https://github.com/Ataraxy-Labs/sem", version = "0.5" }
 ```
 
 Used by [weave](https://github.com/Ataraxy-Labs/weave) (semantic merge driver) and [inspect](https://github.com/Ataraxy-Labs/inspect) (entity-level code review).
@@ -356,13 +494,23 @@ Used by [weave](https://github.com/Ataraxy-Labs/weave) (semantic merge driver) a
 - **xxhash** for structural hashing
 - Plugin system for adding new languages and formats
 
+## Telemetry
+
+sem collects anonymous usage data: the command name (e.g. `diff`, `impact`), CLI version, and operating system. Nothing else — no code, file paths, repo names, or user identity. Events are batched locally and sent in the background, so commands never wait on the network.
+
+Disable it any time:
+
+```bash
+export SEM_NO_TELEMETRY=1   # or DO_NOT_TRACK=1
+```
+
 ## Contributing
 
 Want to add a new language? See [CONTRIBUTING.md](CONTRIBUTING.md) for a step-by-step guide.
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=Ataraxy-Labs/sem&type=Date)](https://star-history.com/#Ataraxy-Labs/sem&Date)
+[![Star History Chart](assets/star-history.png)](https://star-history.com/#Ataraxy-Labs/sem&Date)
 
 ## License
 

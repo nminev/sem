@@ -17,6 +17,11 @@ pkgs.rustPlatform.buildRustPackage rec {
       # "dummy-0.14.0" = lib.fakeHash;
     };
   };
+  cargoBuildFlags = [
+    "--package"
+    "sem-cli"
+  ];
+  cargoTestFlags = cargoBuildFlags;
 
   # disable tests
   checkType = "debug";
@@ -42,4 +47,12 @@ pkgs.rustPlatform.buildRustPackage rec {
   #     --fish ./autocompletion/${pname}.fish \
   #     --zsh  ./autocompletion/_${pname}
   # '';
+
+  meta = {
+    description = "Semantic version control CLI";
+    homepage = "https://github.com/Ataraxy-Labs/sem";
+    license = with lib.licenses; [mit asl20];
+    mainProgram = "sem";
+    platforms = lib.platforms.unix;
+  };
 }

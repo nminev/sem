@@ -3,7 +3,11 @@ use tree_sitter::Node;
 use xxhash_rust::xxh3::Xxh3;
 
 pub fn content_hash(content: &str) -> String {
-    format!("{:016x}", xxhash_rust::xxh3::xxh3_64(content.as_bytes()))
+    content_hash_bytes(content.as_bytes())
+}
+
+pub fn content_hash_bytes(content: &[u8]) -> String {
+    format!("{:016x}", xxhash_rust::xxh3::xxh3_64(content))
 }
 
 pub fn short_hash(content: &str, length: usize) -> String {
@@ -35,38 +39,45 @@ pub fn structural_hash_excluding_range(
     format!("{:016x}", hasher.finish())
 }
 
-/// Recursively hash tokens from the AST, skipping comments.
+/// Iteratively hash tokens from the AST, skipping comments.
 /// Hashes both node types (structure) and leaf text (content) so that
 /// structurally different ASTs with identical leaf tokens produce different hashes.
 /// Zero allocations: hashes directly from source byte slices.
-fn hash_structural_tokens(node: Node, source: &[u8], hasher: &mut Xxh3) {
-    let kind = node.kind();
+fn hash_structural_tokens(root: Node, source: &[u8], hasher: &mut Xxh3) {
+    let mut worklist = vec![root];
+    // One cursor reused for the whole traversal instead of `node.walk()` per
+    // internal node, and children are pushed in place instead of collected into
+    // a fresh Vec per node — the two per-node allocations the old code paid.
+    let mut cursor = root.walk();
+    while let Some(node) = worklist.pop() {
+        let kind = node.kind();
 
-    if is_comment_node(kind) {
-        return;
-    }
-
-    if node.child_count() == 0 {
-        // Leaf node: hash its text directly from the source buffer
-        let start = node.start_byte();
-        let end = node.end_byte();
-        if start < end && end <= source.len() {
-            let bytes = &source[start..end];
-            // Trim whitespace manually to avoid allocation
-            let trimmed = trim_bytes(bytes);
-            if !trimmed.is_empty() {
-                hasher.write(trimmed);
-                hasher.write(b" ");
-            }
+        if is_comment_node(kind) {
+            continue;
         }
-    } else {
-        // Hash the node type to capture structure, not just leaf content.
-        // e.g. `x = foo(bar)` vs `foo(bar) = x` have same leaves but different structure.
-        hasher.write(kind.as_bytes());
-        hasher.write(b":");
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            hash_structural_tokens(child, source, hasher);
+
+        if node.child_count() == 0 {
+            // Leaf node: hash its text directly from the source buffer
+            let start = node.start_byte();
+            let end = node.end_byte();
+            if start < end && end <= source.len() {
+                let bytes = &source[start..end];
+                // Trim whitespace manually to avoid allocation
+                let trimmed = trim_bytes(bytes);
+                if !trimmed.is_empty() {
+                    hasher.write(trimmed);
+                    hasher.write(b" ");
+                }
+            }
+        } else {
+            // Hash the node type to capture structure, not just leaf content.
+            // e.g. `x = foo(bar)` vs `foo(bar) = x` have same leaves but different structure.
+            hasher.write(kind.as_bytes());
+            hasher.write(b":");
+            // Push children in source order, then reverse just the appended
+            // slice so `pop()` yields them in source order — identical traversal
+            // (and identical hash) to the previous `children.rev()` push.
+            push_children_reversed(&mut cursor, node, &mut worklist);
         }
     }
 }
@@ -74,48 +85,79 @@ fn hash_structural_tokens(node: Node, source: &[u8], hasher: &mut Xxh3) {
 /// Like `hash_structural_tokens` but skips any leaf node whose byte range
 /// overlaps the excluded range (the entity name).
 fn hash_structural_tokens_excluding(
-    node: Node,
+    root: Node,
     source: &[u8],
     hasher: &mut Xxh3,
     exclude_start: usize,
     exclude_end: usize,
 ) {
-    let kind = node.kind();
+    let mut worklist = vec![root];
+    let mut cursor = root.walk();
+    while let Some(node) = worklist.pop() {
+        let kind = node.kind();
 
-    if is_comment_node(kind) {
-        return;
-    }
-
-    if node.child_count() == 0 {
-        let start = node.start_byte();
-        let end = node.end_byte();
-        // Skip leaf nodes that overlap the excluded range
-        if start < exclude_end && end > exclude_start {
-            return;
+        if is_comment_node(kind) {
+            continue;
         }
-        if start < end && end <= source.len() {
-            let bytes = &source[start..end];
-            let trimmed = trim_bytes(bytes);
-            if !trimmed.is_empty() {
-                hasher.write(trimmed);
-                hasher.write(b" ");
+
+        if node.child_count() == 0 {
+            let start = node.start_byte();
+            let end = node.end_byte();
+            // Skip leaf nodes that overlap the excluded range
+            if start < exclude_end && end > exclude_start {
+                continue;
+            }
+            if start < end && end <= source.len() {
+                let bytes = &source[start..end];
+                let trimmed = trim_bytes(bytes);
+                if !trimmed.is_empty() {
+                    hasher.write(trimmed);
+                    hasher.write(b" ");
+                }
+            }
+        } else {
+            hasher.write(kind.as_bytes());
+            hasher.write(b":");
+            push_children_reversed(&mut cursor, node, &mut worklist);
+        }
+    }
+}
+
+/// Push `node`'s children onto `worklist` such that a subsequent `pop()`
+/// sequence yields them in source (first-to-last) order, without allocating a
+/// per-node Vec. Children are appended in source order, then the appended tail
+/// is reversed in place. Equivalent to the previous
+/// `node.children(&mut cursor).collect::<Vec<_>>().into_iter().rev()`.
+#[inline]
+fn push_children_reversed<'a>(
+    cursor: &mut tree_sitter::TreeCursor<'a>,
+    node: Node<'a>,
+    worklist: &mut Vec<Node<'a>>,
+) {
+    let base = worklist.len();
+    cursor.reset(node);
+    if cursor.goto_first_child() {
+        loop {
+            worklist.push(cursor.node());
+            if !cursor.goto_next_sibling() {
+                break;
             }
         }
-    } else {
-        hasher.write(kind.as_bytes());
-        hasher.write(b":");
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            hash_structural_tokens_excluding(child, source, hasher, exclude_start, exclude_end);
-        }
     }
+    worklist[base..].reverse();
 }
 
 /// Trim leading/trailing ASCII whitespace from a byte slice without allocating.
 #[inline]
 fn trim_bytes(bytes: &[u8]) -> &[u8] {
-    let start = bytes.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(bytes.len());
-    let end = bytes.iter().rposition(|b| !b.is_ascii_whitespace()).map_or(start, |p| p + 1);
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(start, |p| p + 1);
     &bytes[start..end]
 }
 
@@ -142,6 +184,11 @@ mod tests {
         let h = content_hash("test");
         assert_eq!(h.len(), 16); // xxHash64 = 8 bytes = 16 hex chars
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_content_hash_bytes_matches_string_hash() {
+        assert_eq!(content_hash_bytes(b"test"), content_hash("test"));
     }
 
     #[test]

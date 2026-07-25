@@ -6,8 +6,9 @@ use std::collections::HashMap;
 
 use crate::model::entity::SemanticEntity;
 use crate::parser::plugin::SemanticParserPlugin;
-use languages::{get_all_code_extensions, get_language_config};
+use crate::utils::hash::{content_hash, structural_hash};
 use entity_extractor::extract_entities;
+use languages::{get_all_code_extensions, get_language_config};
 
 pub struct CodeParserPlugin;
 
@@ -15,6 +16,81 @@ pub struct CodeParserPlugin;
 // Avoids creating a new Parser for every file during parallel graph builds.
 thread_local! {
     static PARSER_CACHE: RefCell<HashMap<&'static str, tree_sitter::Parser>> = RefCell::new(HashMap::new());
+}
+
+fn language_config_for_content(
+    content: &str,
+    file_path: &str,
+) -> Option<&'static languages::LanguageConfig> {
+    let ext = std::path::Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{}", e.to_lowercase()))
+        .unwrap_or_default();
+
+    get_language_config(&ext).or_else(|| {
+        detect_ext_from_content(content).and_then(|shebang_ext| get_language_config(&shebang_ext))
+    })
+}
+
+fn parse_tree(
+    config: &'static languages::LanguageConfig,
+    content: &str,
+) -> Option<tree_sitter::Tree> {
+    let language = (config.get_language)()?;
+
+    PARSER_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let parser = cache.entry(config.id).or_insert_with(|| {
+            let mut p = tree_sitter::Parser::new();
+            let _ = p.set_language(&language);
+            p
+        });
+
+        parser.parse(content.as_bytes(), None)
+    })
+}
+
+fn has_non_comment_content(node: tree_sitter::Node, source: &[u8]) -> bool {
+    let mut worklist = Vec::new();
+    let mut cursor = node.walk();
+    worklist.extend(node.children(&mut cursor));
+
+    while let Some(node) = worklist.pop() {
+        if is_comment_node(node.kind()) {
+            continue;
+        }
+
+        if node.child_count() == 0 {
+            let start = node.start_byte();
+            let end = node.end_byte();
+            if start < end
+                && end <= source.len()
+                && source[start..end].iter().any(|b| !b.is_ascii_whitespace())
+            {
+                return true;
+            }
+            continue;
+        }
+
+        let mut cursor = node.walk();
+        worklist.extend(node.children(&mut cursor));
+    }
+
+    false
+}
+
+fn is_comment_node(kind: &str) -> bool {
+    matches!(
+        kind,
+        "comment" | "line_comment" | "block_comment" | "doc_comment" | "tag_comment"
+    )
+}
+
+fn shebang_line(content: &str) -> Option<&str> {
+    content
+        .strip_prefix("#!")
+        .map(|rest| rest.lines().next().unwrap_or(""))
 }
 
 impl SemanticParserPlugin for CodeParserPlugin {
@@ -35,46 +111,30 @@ impl SemanticParserPlugin for CodeParserPlugin {
         content: &str,
         file_path: &str,
     ) -> (Vec<SemanticEntity>, Option<tree_sitter::Tree>) {
-        let ext = std::path::Path::new(file_path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| format!(".{}", e.to_lowercase()))
-            .unwrap_or_default();
-
-        let config = match get_language_config(&ext) {
-            Some(c) => c,
-            None => {
-                // Try shebang detection for extensionless files
-                match detect_ext_from_content(content)
-                    .and_then(|se| get_language_config(&se))
-                {
-                    Some(c) => c,
-                    None => return (Vec::new(), None),
-                }
-            }
+        let Some(config) = language_config_for_content(content, file_path) else {
+            return (Vec::new(), None);
         };
 
-        let language = match (config.get_language)() {
-            Some(lang) => lang,
-            None => return (Vec::new(), None),
+        let Some(tree) = parse_tree(config, content) else {
+            return (Vec::new(), None);
         };
 
-        PARSER_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            let parser = cache.entry(config.id).or_insert_with(|| {
-                let mut p = tree_sitter::Parser::new();
-                let _ = p.set_language(&language);
-                p
-            });
+        let entities = extract_entities(&tree, file_path, config, content);
+        (entities, Some(tree))
+    }
 
-            let tree = match parser.parse(content.as_bytes(), None) {
-                Some(t) => t,
-                None => return (Vec::new(), None),
-            };
-
-            let entities = extract_entities(&tree, file_path, config, content);
-            (entities, Some(tree))
-        })
+    fn structural_hash_content(&self, content: &str, file_path: &str) -> Option<String> {
+        let config = language_config_for_content(content, file_path)?;
+        let tree = parse_tree(config, content)?;
+        let shebang = shebang_line(content);
+        if shebang.is_none() && !has_non_comment_content(tree.root_node(), content.as_bytes()) {
+            return Some(String::new());
+        }
+        let structural = structural_hash(tree.root_node(), content.as_bytes());
+        match shebang {
+            Some(shebang) => Some(content_hash(&format!("shebang:{shebang}\n{structural}"))),
+            None => Some(structural),
+        }
     }
 }
 
@@ -122,11 +182,38 @@ enum Status {
         let entities = plugin.extract_entities(code, "UserService.java");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
-        eprintln!("Java entities: {:?}", names.iter().zip(types.iter()).collect::<Vec<_>>());
+        eprintln!(
+            "Java entities: {:?}",
+            names.iter().zip(types.iter()).collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"UserService"), "Should find class UserService, got: {:?}", names);
-        assert!(names.contains(&"Repository"), "Should find interface Repository, got: {:?}", names);
-        assert!(names.contains(&"Status"), "Should find enum Status, got: {:?}", names);
+        assert!(
+            names.contains(&"UserService"),
+            "Should find class UserService, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Repository"),
+            "Should find interface Repository, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Status"),
+            "Should find enum Status, got: {:?}",
+            names
+        );
+
+        // A field is named by its declarator, not its type: `private String name;`
+        // is the field `name`, not `String`.
+        let field = entities
+            .iter()
+            .find(|e| e.entity_type == "field")
+            .expect("should extract the field entity");
+        assert_eq!(
+            field.name, "name",
+            "field should be named by its declarator, got: {:?}",
+            field.name
+        );
     }
 
     #[test]
@@ -145,11 +232,28 @@ public class Calculator {
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "Calculator.java");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("Java nested: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type, &e.parent_id)).collect::<Vec<_>>());
+        eprintln!(
+            "Java nested: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                .collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"Calculator"), "Should find Calculator class");
-        assert!(names.contains(&"add"), "Should find add method, got: {:?}", names);
-        assert!(names.contains(&"subtract"), "Should find subtract method, got: {:?}", names);
+        assert!(
+            names.contains(&"Calculator"),
+            "Should find Calculator class"
+        );
+        assert!(
+            names.contains(&"add"),
+            "Should find add method, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"subtract"),
+            "Should find subtract method, got: {:?}",
+            names
+        );
 
         // Methods should have Calculator as parent
         let add = entities.iter().find(|e| e.name == "add").unwrap();
@@ -194,13 +298,59 @@ int main() {
         let entities = plugin.extract_entities(code, "main.c");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
-        eprintln!("C entities: {:?}", names.iter().zip(types.iter()).collect::<Vec<_>>());
+        eprintln!(
+            "C entities: {:?}",
+            names.iter().zip(types.iter()).collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"greet"), "Should find greet function, got: {:?}", names);
-        assert!(names.contains(&"add"), "Should find add function, got: {:?}", names);
-        assert!(names.contains(&"main"), "Should find main function, got: {:?}", names);
-        assert!(names.contains(&"Point"), "Should find Point struct, got: {:?}", names);
-        assert!(names.contains(&"Color"), "Should find Color enum, got: {:?}", names);
+        assert!(
+            names.contains(&"greet"),
+            "Should find greet function, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"add"),
+            "Should find add function, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"main"),
+            "Should find main function, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Point"),
+            "Should find Point struct, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Color"),
+            "Should find Color enum, got: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_c_function_locals_not_extracted() {
+        let code = r#"
+int global_count = 0;
+int helper(void);
+
+int main(void) {
+    int local = helper();
+    const char *message = "hello";
+    return local + global_count;
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "main.c");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains(&"global_count"), "got: {:?}", names);
+        assert!(names.contains(&"helper"), "got: {:?}", names);
+        assert!(names.contains(&"main"), "got: {:?}", names);
+        assert!(!names.contains(&"local"), "got: {:?}", names);
+        assert!(!names.contains(&"message"), "got: {:?}", names);
     }
 
     #[test]
@@ -212,6 +362,33 @@ int main() {
         assert!(names.contains(&"math"), "got: {:?}", names);
         assert!(names.contains(&"Vector3"), "got: {:?}", names);
         assert!(names.contains(&"greet"), "got: {:?}", names);
+    }
+
+    #[test]
+    fn test_cpp_function_locals_not_extracted() {
+        let code = r#"
+int global_value = 1;
+int helper();
+
+int main() {
+    int local = helper();
+    auto lambda = []() {
+        int lambda_local = 3;
+        return lambda_local;
+    };
+    return local + lambda();
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "main.cpp");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains(&"global_value"), "got: {:?}", names);
+        assert!(names.contains(&"helper"), "got: {:?}", names);
+        assert!(names.contains(&"main"), "got: {:?}", names);
+        assert!(!names.contains(&"local"), "got: {:?}", names);
+        assert!(!names.contains(&"lambda"), "got: {:?}", names);
+        assert!(!names.contains(&"lambda_local"), "got: {:?}", names);
     }
 
     #[test]
@@ -241,11 +418,19 @@ int main() {
         let code = r#"
 import Foundation
 
+typealias Handler = (Int) -> Void
+
+prefix operator ~~~
+
 class UserService {
     var name: String
 
     init(name: String) {
         self.name = name
+    }
+
+    deinit {
+        print("freed")
     }
 
     func getUsers() -> [User] {
@@ -256,6 +441,10 @@ class UserService {
 struct Point {
     var x: Double
     var y: Double
+
+    subscript(index: Int) -> Double {
+        return x + y + Double(index)
+    }
 }
 
 enum Status {
@@ -265,9 +454,9 @@ enum Status {
 }
 
 protocol Repository {
-    associatedtype Item
-    func findById(id: String) -> Item?
-    func findAll() -> [Item]
+    associatedtype Canvas
+    func findById(id: String) -> Canvas?
+    func findAll() -> [Canvas]
 }
 
 func helper(x: Int) -> Int {
@@ -277,13 +466,519 @@ func helper(x: Int) -> Int {
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "UserService.swift");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("Swift entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        eprintln!(
+            "Swift entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"UserService"), "Should find class UserService, got: {:?}", names);
-        assert!(names.contains(&"Point"), "Should find struct Point, got: {:?}", names);
-        assert!(names.contains(&"Status"), "Should find enum Status, got: {:?}", names);
-        assert!(names.contains(&"Repository"), "Should find protocol Repository, got: {:?}", names);
-        assert!(names.contains(&"helper"), "Should find function helper, got: {:?}", names);
+        assert!(
+            names.contains(&"UserService"),
+            "Should find class UserService, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Point"),
+            "Should find struct Point, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Status"),
+            "Should find enum Status, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Repository"),
+            "Should find protocol Repository, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Canvas"),
+            "Should find associatedtype Canvas, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Handler"),
+            "Should find typealias Handler, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"~~~"),
+            "Should find custom operator ~~~, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"init"),
+            "Should find initializer init, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"deinit"),
+            "Should find deinitializer deinit, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"subscript"),
+            "Should find subscript, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"helper"),
+            "Should find function helper, got: {:?}",
+            names
+        );
+
+        let handler = entities.iter().find(|e| e.name == "Handler").unwrap();
+        assert_eq!(handler.entity_type, "type");
+        assert!(handler.parent_id.is_none());
+
+        let operator = entities.iter().find(|e| e.name == "~~~").unwrap();
+        assert_eq!(operator.entity_type, "operator");
+        assert!(operator.parent_id.is_none());
+
+        let user_service = entities.iter().find(|e| e.name == "UserService").unwrap();
+        assert_eq!(user_service.entity_type, "class");
+
+        let initializer = entities.iter().find(|e| e.name == "init").unwrap();
+        assert_eq!(initializer.entity_type, "init");
+        assert_eq!(
+            initializer.parent_id.as_deref(),
+            Some(user_service.id.as_str())
+        );
+        assert_eq!(
+            initializer.id,
+            "UserService.swift::class::UserService::init"
+        );
+
+        let deinitializer = entities.iter().find(|e| e.name == "deinit").unwrap();
+        assert_eq!(deinitializer.entity_type, "deinit");
+        assert_eq!(
+            deinitializer.parent_id.as_deref(),
+            Some(user_service.id.as_str())
+        );
+        assert_eq!(
+            deinitializer.id,
+            "UserService.swift::class::UserService::deinit"
+        );
+
+        let point = entities.iter().find(|e| e.name == "Point").unwrap();
+        assert_eq!(point.entity_type, "struct");
+
+        let subscript = entities.iter().find(|e| e.name == "subscript").unwrap();
+        assert_eq!(subscript.entity_type, "subscript");
+        assert_eq!(subscript.parent_id.as_deref(), Some(point.id.as_str()));
+        assert_eq!(subscript.id, "UserService.swift::struct::Point::subscript");
+
+        let status = entities.iter().find(|e| e.name == "Status").unwrap();
+        assert_eq!(status.entity_type, "enum");
+
+        let repository = entities.iter().find(|e| e.name == "Repository").unwrap();
+        assert_eq!(repository.entity_type, "protocol");
+        assert_eq!(repository.id, "UserService.swift::protocol::Repository");
+
+        let canvas = entities.iter().find(|e| e.name == "Canvas").unwrap();
+        assert_eq!(canvas.entity_type, "associatedtype");
+        assert_eq!(canvas.parent_id.as_deref(), Some(repository.id.as_str()));
+        assert_eq!(canvas.id, "UserService.swift::protocol::Repository::Canvas");
+    }
+
+    #[test]
+    fn test_swift_multi_binding_property_extraction() {
+        let code = r#"
+struct Point {
+    var x, y: Int
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "Point.swift");
+        let point = entities.iter().find(|e| e.name == "Point").unwrap();
+        let properties: Vec<_> = entities
+            .iter()
+            .filter(|e| e.entity_type == "property")
+            .collect();
+
+        assert_eq!(
+            properties
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x", "y"]
+        );
+        assert!(properties
+            .iter()
+            .all(|property| property.parent_id.as_deref() == Some(point.id.as_str())));
+        assert_eq!(properties[0].content, "var x: Int");
+        assert_eq!(properties[1].content, "var y: Int");
+    }
+
+    #[test]
+    fn test_swift_multi_binding_property_content_is_per_binding() {
+        let typed_code = r#"
+struct Types {
+    var x: Int, y: String
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let typed_entities = plugin.extract_entities(typed_code, "Types.swift");
+        let typed_properties: Vec<_> = typed_entities
+            .iter()
+            .filter(|e| e.entity_type == "property")
+            .collect();
+        assert_eq!(typed_properties[0].content, "var x: Int");
+        assert_eq!(typed_properties[1].content, "var y: String");
+
+        let mixed_code = r#"
+struct Mixed {
+    var x, y: Int, z: String
+}
+"#;
+        let mixed_entities = plugin.extract_entities(mixed_code, "Mixed.swift");
+        let mixed_properties: Vec<_> = mixed_entities
+            .iter()
+            .filter(|e| e.entity_type == "property")
+            .collect();
+        assert_eq!(mixed_properties[0].content, "var x: Int");
+        assert_eq!(mixed_properties[1].content, "var y: Int");
+        assert_eq!(mixed_properties[2].content, "var z: String");
+
+        let generic_code = r#"
+struct GenericTypes {
+    var lookup: Dictionary<String, Int>, count: Int
+}
+"#;
+        let generic_entities = plugin.extract_entities(generic_code, "GenericTypes.swift");
+        let generic_properties: Vec<_> = generic_entities
+            .iter()
+            .filter(|e| e.entity_type == "property")
+            .collect();
+        assert_eq!(
+            generic_properties[0].content,
+            "var lookup: Dictionary<String, Int>"
+        );
+        assert_eq!(generic_properties[1].content, "var count: Int");
+
+        let initializer_code = r#"
+struct Initializers {
+    var a = Foo(), b = Bar()
+}
+"#;
+        let initializer_entities = plugin.extract_entities(initializer_code, "Initializers.swift");
+        let initializer_properties: Vec<_> = initializer_entities
+            .iter()
+            .filter(|e| e.entity_type == "property")
+            .collect();
+        assert!(initializer_properties[0].content.contains("Foo()"));
+        assert!(!initializer_properties[0].content.contains("Bar()"));
+        assert!(initializer_properties[1].content.contains("Bar()"));
+        assert!(!initializer_properties[1].content.contains("Foo()"));
+
+        let constants_code = r#"
+struct Constants {
+    let first, second, third: Int
+}
+"#;
+        let constants_entities = plugin.extract_entities(constants_code, "Constants.swift");
+        let constants_properties: Vec<_> = constants_entities
+            .iter()
+            .filter(|e| e.entity_type == "property")
+            .collect();
+        assert_eq!(
+            constants_properties
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+        assert_eq!(constants_properties[0].content, "let first: Int");
+        assert_eq!(constants_properties[1].content, "let second: Int");
+        assert_eq!(constants_properties[2].content, "let third: Int");
+
+        let semicolon_code = r#"
+struct Semicolons {
+    var left, right: Int; var next: Int
+}
+"#;
+        let semicolon_entities = plugin.extract_entities(semicolon_code, "Semicolons.swift");
+        let semicolon_properties: Vec<_> = semicolon_entities
+            .iter()
+            .filter(|e| e.entity_type == "property")
+            .collect();
+        assert_eq!(semicolon_properties[0].content, "var left: Int");
+        assert_eq!(semicolon_properties[1].content, "var right: Int");
+        assert_eq!(semicolon_properties[2].content, "var next: Int");
+    }
+
+    #[test]
+    fn test_swift_body_locals_not_extracted_as_properties() {
+        let code = r#"
+class Cache {
+    var stored: Int
+
+    var computed: Int {
+        let computedLocal = stored + 1
+        func computedNested() -> Int {
+            return computedLocal
+        }
+        return computedNested()
+    }
+
+    var explicit: Int {
+        get {
+            let getterLocal = stored
+            func getterNested() -> Int {
+                return getterLocal
+            }
+            return getterNested()
+        }
+    }
+
+    init(seed: Int) {
+        let initial = seed
+        self.stored = initial
+    }
+
+    func value() -> Int {
+        let doubled = stored * 2
+        var offset = doubled + 1
+        func nested() -> Int {
+            let insideNested = offset
+            return insideNested
+        }
+        return nested()
+    }
+
+    subscript(index: Int) -> Int {
+        let shifted = index + stored
+        func subscriptNested() -> Int {
+            return shifted
+        }
+        return subscriptNested()
+    }
+
+    deinit {
+        let closing = stored
+        _ = closing
+    }
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "Cache.swift");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains(&"Cache"), "got: {:?}", names);
+        assert!(names.contains(&"stored"), "got: {:?}", names);
+        assert!(names.contains(&"computed"), "got: {:?}", names);
+        assert!(names.contains(&"explicit"), "got: {:?}", names);
+        assert!(names.contains(&"init"), "got: {:?}", names);
+        assert!(names.contains(&"value"), "got: {:?}", names);
+        assert!(names.contains(&"computedNested"), "got: {:?}", names);
+        assert!(names.contains(&"getterNested"), "got: {:?}", names);
+        assert!(names.contains(&"nested"), "got: {:?}", names);
+        assert!(names.contains(&"subscriptNested"), "got: {:?}", names);
+        assert!(names.contains(&"subscript"), "got: {:?}", names);
+        assert!(names.contains(&"deinit"), "got: {:?}", names);
+        assert!(!names.contains(&"Int"), "got: {:?}", names);
+
+        for local in [
+            "computedLocal",
+            "getterLocal",
+            "initial",
+            "doubled",
+            "offset",
+            "insideNested",
+            "shifted",
+            "closing",
+        ] {
+            assert!(
+                !names.contains(&local),
+                "{local} should not be an entity. Got: {:?}",
+                names
+            );
+        }
+    }
+
+    #[test]
+    fn test_swift_suppressed_multi_binding_initializers_are_traversed() {
+        let code = r#"
+func outer() {
+    let a = { func innerA() -> Int { 1 } },
+        b = { func innerB() -> Int { 2 } }
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "Locals.swift");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains(&"outer"), "got: {:?}", names);
+        assert!(names.contains(&"innerA"), "got: {:?}", names);
+        assert!(names.contains(&"innerB"), "got: {:?}", names);
+        assert!(
+            !names.contains(&"a"),
+            "local binding should stay suppressed: {:?}",
+            names
+        );
+        assert!(
+            !names.contains(&"b"),
+            "local binding should stay suppressed: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_swift_conditional_compilation_inside_struct() {
+        let code = r#"
+import ArgumentParser
+
+public struct TuistCommand: AsyncParsableCommand {
+    public init() {}
+
+    public static var configuration: CommandConfiguration {
+        let comment = "brace in string }"
+        let multiline = """
+        brace in multiline }
+        escaped \"""
+        """
+        /* brace in comment } */
+        CommandConfiguration(commandName: "tuist")
+    }
+
+    #if os(macOS)
+        public static var groupedSubcommands: [ParsableCommand.Type] {
+            [InstallCommand.self]
+        }
+    #else
+        public static var groupedSubcommands: [ParsableCommand.Type] {
+            []
+        }
+    #endif
+
+    public func run() async throws {}
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "TuistCommand.swift");
+        eprintln!(
+            "Swift conditional entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                .collect::<Vec<_>>()
+        );
+
+        let command = entities
+            .iter()
+            .find(|e| e.name == "TuistCommand")
+            .expect("Should recover TuistCommand struct");
+        assert_eq!(command.entity_type, "struct");
+        assert!(command.parent_id.is_none());
+
+        let renamed_code = code.replace("TuistCommand", "RenamedCommand");
+        let renamed_entities = plugin.extract_entities(&renamed_code, "TuistCommand.swift");
+        let renamed_command = renamed_entities
+            .iter()
+            .find(|e| e.name == "RenamedCommand")
+            .expect("Should recover renamed command struct");
+        assert_eq!(command.structural_hash, renamed_command.structural_hash);
+
+        for member in ["init", "configuration", "run"] {
+            let entity = entities
+                .iter()
+                .find(|e| e.name == member)
+                .unwrap_or_else(|| panic!("Should find {member}"));
+            assert_eq!(entity.parent_id.as_deref(), Some(command.id.as_str()));
+        }
+
+        let grouped_subcommands: Vec<_> = entities
+            .iter()
+            .filter(|e| e.name == "groupedSubcommands")
+            .collect();
+        assert_eq!(grouped_subcommands.len(), 2);
+        assert!(grouped_subcommands
+            .iter()
+            .all(|entity| entity.parent_id.as_deref() == Some(command.id.as_str())));
+    }
+
+    #[test]
+    fn test_swift_conditional_compilation_with_interpolated_brace_string() {
+        let plugin = CodeParserPlugin;
+        for (container_name, code) in [
+            (
+                "Config",
+                r#"
+class Config {
+    let tpl = "prefix \("}") suffix"
+#if DEBUG
+    func dump() { print(tpl) }
+#endif
+    func render() -> String { return tpl }
+}
+
+struct Tail { let q: Int }
+"#,
+            ),
+            (
+                "RawConfig",
+                r##"
+class RawConfig {
+    let tpl = #"prefix \#("{") suffix"#
+#if DEBUG
+    func dump() { print(tpl) }
+#endif
+    func render() -> String { return tpl }
+}
+"##,
+            ),
+            (
+                "MultilineConfig",
+                r#"
+class MultilineConfig {
+    let tpl = """
+    prefix \("}") suffix
+    """
+#if DEBUG
+    func dump() { print(tpl) }
+#endif
+    func render() -> String { return tpl }
+}
+"#,
+            ),
+            (
+                "ClosureConfig",
+                r#"
+class ClosureConfig {
+    let tpl = "prefix \(["}"].map { $0 }.joined()) suffix"
+#if DEBUG
+    func dump() { print(tpl) }
+#endif
+    func render() -> String { return tpl }
+}
+"#,
+            ),
+        ] {
+            let file_path = format!("{container_name}.swift");
+            let entities = plugin.extract_entities(code, &file_path);
+            let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+            let container = entities
+                .iter()
+                .find(|e| e.name == container_name)
+                .unwrap_or_else(|| {
+                    panic!("Should recover {container_name}, got: {names:?}");
+                });
+            assert_eq!(container.entity_type, "class");
+            assert!(container.parent_id.is_none());
+
+            for member in ["tpl", "dump", "render"] {
+                let entity = entities
+                    .iter()
+                    .find(|e| e.name == member)
+                    .unwrap_or_else(|| {
+                        panic!("Should find {member} in {container_name}, got: {names:?}");
+                    });
+                assert_eq!(entity.parent_id.as_deref(), Some(container.id.as_str()));
+            }
+        }
     }
 
     #[test]
@@ -322,17 +1017,340 @@ end
         let entities = plugin.extract_entities(code, "accounts.ex");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
-        eprintln!("Elixir entities: {:?}", names.iter().zip(types.iter()).collect::<Vec<_>>());
+        eprintln!(
+            "Elixir entities: {:?}",
+            names.iter().zip(types.iter()).collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"MyApp.Accounts"), "Should find module, got: {:?}", names);
-        assert!(names.contains(&"create_user"), "Should find def, got: {:?}", names);
-        assert!(names.contains(&"validate"), "Should find defp, got: {:?}", names);
-        assert!(names.contains(&"is_admin"), "Should find defmacro, got: {:?}", names);
-        assert!(names.contains(&"Printable"), "Should find defprotocol, got: {:?}", names);
+        assert!(
+            names.contains(&"MyApp.Accounts"),
+            "Should find module, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"create_user"),
+            "Should find def, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"validate"),
+            "Should find defp, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"is_admin"),
+            "Should find defmacro, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Printable"),
+            "Should find defprotocol, got: {:?}",
+            names
+        );
 
         // Verify nesting: create_user should have MyApp.Accounts as parent
         let create_user = entities.iter().find(|e| e.name == "create_user").unwrap();
-        assert!(create_user.parent_id.is_some(), "create_user should be nested under module");
+        assert!(
+            create_user.parent_id.is_some(),
+            "create_user should be nested under module"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_entity_extraction() {
+        let code = r#"
+(ns my.app.core
+  (:require [clojure.string :as str]))
+
+(def my-var 42)
+
+(def ^:private secret "hunter2")
+
+(defonce connection (atom nil))
+
+(defn greet
+  "Returns a greeting string."
+  [name]
+  (str "Hello, " name "!"))
+
+(defmacro unless [pred & body]
+  `(when (not ~pred) ~@body))
+
+(defprotocol Greeter
+  (greet! [this name]))
+
+(defrecord Person [name age])
+
+(defmulti area :shape)
+
+(defmethod area :circle [{:keys [radius]}]
+  (* Math/PI radius radius))
+
+(defmethod area :rectangle [{:keys [width height]}]
+  (* width height))
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "core.clj");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        eprintln!(
+            "Clojure entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
+
+        assert!(
+            !names.contains(&"my.app.core"),
+            "Should not extract ns form as entity, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"my-var"),
+            "Should find def, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"secret"),
+            "Should strip ^:private metadata from name, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"connection"),
+            "Should find defonce, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"greet"),
+            "Should find defn, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"unless"),
+            "Should find defmacro, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Greeter"),
+            "Should find defprotocol, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Person"),
+            "Should find defrecord, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"area"),
+            "Should find defmulti, got: {:?}",
+            names
+        );
+        // defmethods get dispatch-qualified names so two methods on the same multimethod are distinct
+        assert!(
+            names.contains(&"area/:circle"),
+            "Should find defmethod area :circle, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"area/:rectangle"),
+            "Should find defmethod area :rectangle, got: {:?}",
+            names
+        );
+        let ids: Vec<&str> = entities.iter().map(|e| e.id.as_str()).collect();
+        assert!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len() == ids.len(),
+            "All entity IDs must be unique, got: {:?}",
+            ids
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_defn_private() {
+        let code = r#"
+(ns my.app)
+
+(defn- private-helper [x]
+  (* x 2))
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "app.clj");
+        let entity = entities
+            .iter()
+            .find(|e| e.name == "private-helper")
+            .expect("Should extract defn- as a function entity");
+        assert_eq!(entity.entity_type, "function");
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_predicate_and_bang_functions() {
+        let code = r#"
+(ns my.app.validators)
+
+(defn empty? [coll]
+  (= 0 (count coll)))
+
+(defn reset! [state new-val]
+  (compare-and-set! state @state new-val))
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "validators.clj");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"empty?"),
+            "Should extract predicate fn empty?, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"reset!"),
+            "Should extract bang fn reset!, got: {:?}",
+            names
+        );
+        let empty_entity = entities.iter().find(|e| e.name == "empty?").unwrap();
+        let reset_entity = entities.iter().find(|e| e.name == "reset!").unwrap();
+        assert_eq!(empty_entity.entity_type, "function");
+        assert_eq!(reset_entity.entity_type, "function");
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_dynamic_vars_and_equality_fns() {
+        let code = r#"
+(ns my.app.core)
+
+(def *db* (atom nil))
+
+(defn not= [a b]
+  (not (= a b)))
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "core.clj");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"*db*"),
+            "Should extract dynamic var *db*, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"not="),
+            "Should extract fn not=, got: {:?}",
+            names
+        );
+        let db_entity = entities.iter().find(|e| e.name == "*db*").unwrap();
+        let noteq_entity = entities.iter().find(|e| e.name == "not=").unwrap();
+        assert_eq!(db_entity.entity_type, "var");
+        assert_eq!(noteq_entity.entity_type, "function");
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_deftype_definterface_defstruct() {
+        let code = r#"
+(ns my.app)
+
+(deftype MyType [field])
+
+(definterface IFoo
+  (foo [this]))
+
+(defstruct point :x :y)
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "app.clj");
+        let by_name = |name: &str| entities.iter().find(|e| e.name == name);
+
+        assert!(
+            by_name("MyType").is_some(),
+            "Should extract deftype, got: {:?}",
+            entities.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        assert_eq!(by_name("MyType").unwrap().entity_type, "type");
+
+        assert!(
+            by_name("IFoo").is_some(),
+            "Should extract definterface, got: {:?}",
+            entities.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        assert_eq!(by_name("IFoo").unwrap().entity_type, "interface");
+
+        assert!(
+            by_name("point").is_some(),
+            "Should extract defstruct, got: {:?}",
+            entities.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        assert_eq!(by_name("point").unwrap().entity_type, "struct");
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_cljc_extension() {
+        let code = r#"
+(ns my.app.shared)
+
+(defn platform-key [] :default)
+
+(def shared-value 99)
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "shared.cljc");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"platform-key"),
+            "Should extract defn from .cljc, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"shared-value"),
+            "Should extract def from .cljc, got: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-clojure")]
+    fn test_clojure_defmethod_non_keyword_dispatch() {
+        let code = r#"
+(ns my.app)
+
+(defmulti process identity)
+
+(defmethod process nil [_] :nothing)
+
+(defmethod process "string" [s] s)
+
+(defmethod process 42 [n] n)
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "app.clj");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"process"),
+            "Should extract defmulti, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"process/nil"),
+            "Should extract defmethod with nil dispatch, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"process/\"string\""),
+            "Should extract defmethod with string dispatch, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"process/42"),
+            "Should extract defmethod with integer dispatch, got: {:?}",
+            names
+        );
+        let ids: Vec<&str> = entities.iter().map(|e| e.id.as_str()).collect();
+        assert!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len() == ids.len(),
+            "All entity IDs must be unique, got: {:?}",
+            ids
+        );
     }
 
     #[test]
@@ -354,11 +1372,142 @@ echo "main script"
         let entities = plugin.extract_entities(code, "deploy.sh");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
-        eprintln!("Bash entities: {:?}", names.iter().zip(types.iter()).collect::<Vec<_>>());
+        eprintln!(
+            "Bash entities: {:?}",
+            names.iter().zip(types.iter()).collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"greet"), "Should find greet(), got: {:?}", names);
-        assert!(names.contains(&"deploy"), "Should find function deploy, got: {:?}", names);
-        assert_eq!(entities.len(), 2, "Should only find functions, got: {:?}", names);
+        assert!(
+            names.contains(&"greet"),
+            "Should find greet(), got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"deploy"),
+            "Should find function deploy, got: {:?}",
+            names
+        );
+        assert_eq!(
+            entities.len(),
+            2,
+            "Should only find functions, got: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_entity_byte_offsets_slice_source_exactly() {
+        // Byte offsets must let a consumer slice the exact original bytes of an
+        // entity out of the source given only file_path + the span (#requested
+        // by a sem-core user: pull exact content from git by file + entity id).
+        let code =
+            "import os\n\ndef first(a):\n    return a + 1\n\ndef second(b):\n    return b * 2\n";
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "demo.py");
+        let bytes = code.as_bytes();
+        let funcs: Vec<_> = entities
+            .iter()
+            .filter(|e| e.entity_type == "function")
+            .collect();
+        assert_eq!(funcs.len(), 2, "expected 2 functions, got {:?}", funcs);
+        for e in funcs {
+            let sb = e.start_byte.expect("function entity must carry start_byte");
+            let eb = e.end_byte.expect("function entity must carry end_byte");
+            let sliced = std::str::from_utf8(&bytes[sb..eb]).unwrap();
+            assert!(
+                sliced.starts_with(&format!("def {}", e.name)),
+                "bytes[{sb}..{eb}] = {sliced:?} should be the body of {}",
+                e.name
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "lang-lua")]
+    fn test_lua_entity_extraction() {
+        let code = r#"local M = {}
+
+function greet(name)
+    return "hello " .. name
+end
+
+local function helper(x)
+    return x * 2
+end
+
+function M.compute(a, b)
+    return helper(a) + helper(b)
+end
+
+function M:method(v)
+    return v
+end
+
+return M
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "demo.lua");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        // global, local, table (dot) and method (colon) forms all extract
+        assert!(
+            names.contains(&"greet"),
+            "global function, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"helper"),
+            "local function, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"M.compute"),
+            "table function, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"M:method"),
+            "method function, got: {:?}",
+            names
+        );
+        assert_eq!(entities.len(), 4, "only functions, got: {:?}", names);
+    }
+
+    #[test]
+    #[cfg(feature = "lang-fish")]
+    fn test_fish_entity_extraction() {
+        let code = r#"function greet
+    echo "hello $argv[1]"
+end
+
+# the config.fish pattern: definitions wrapped in a top-level guard
+if status is-interactive
+    function fish_prompt
+        set_color green
+        echo -n (prompt_pwd) '> '
+    end
+end
+
+function notify --on-event fish_command_finished --description "ping on done"
+    greet $argv
+end
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "config.fish");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains(&"greet"), "plain function, got: {:?}", names);
+        assert!(
+            names.contains(&"fish_prompt"),
+            "function inside a top-level if block, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"notify"),
+            "function with option flags, got: {:?}",
+            names
+        );
+        assert_eq!(entities.len(), 3, "only functions, got: {:?}", names);
     }
 
     #[test]
@@ -380,6 +1529,52 @@ export class Greeter {
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"hello"), "Should find hello function");
         assert!(names.contains(&"Greeter"), "Should find Greeter class");
+    }
+
+    #[test]
+    fn test_same_line_typescript_overload_ids_are_unique() {
+        let code = "function f(a: number): void {}; function f(a: string): void {}\n";
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "over.ts");
+        let overloads: Vec<&SemanticEntity> = entities
+            .iter()
+            .filter(|entity| entity.name == "f" && entity.entity_type == "function")
+            .collect();
+        let ids: Vec<&str> = overloads.iter().map(|entity| entity.id.as_str()).collect();
+
+        assert_eq!(
+            overloads.len(),
+            2,
+            "expected both overloads, got: {entities:?}"
+        );
+        assert_eq!(
+            ids,
+            vec!["over.ts::function::f@L1#1", "over.ts::function::f@L1#2"]
+        );
+    }
+
+    #[test]
+    fn test_same_line_duplicate_parent_ids_are_propagated_to_children() {
+        let code = "class C { m(){ return 1 } } class C { m(){ return 2 } }\n";
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "c.ts");
+        let classes: Vec<&SemanticEntity> = entities
+            .iter()
+            .filter(|entity| entity.name == "C" && entity.entity_type == "class")
+            .collect();
+        let methods: Vec<&SemanticEntity> = entities
+            .iter()
+            .filter(|entity| entity.name == "m" && entity.entity_type == "method")
+            .collect();
+
+        assert_eq!(classes.len(), 2, "expected both classes, got: {entities:?}");
+        assert_eq!(methods.len(), 2, "expected both methods, got: {entities:?}");
+        assert_eq!(classes[0].id, "c.ts::class::C@L1#1");
+        assert_eq!(classes[1].id, "c.ts::class::C@L1#2");
+        assert_eq!(methods[0].parent_id.as_deref(), Some("c.ts::class::C@L1#1"));
+        assert_eq!(methods[1].parent_id.as_deref(), Some("c.ts::class::C@L1#2"));
+        assert_eq!(methods[0].id, "c.ts::class::C@L1#1::m");
+        assert_eq!(methods[1].id, "c.ts::class::C@L1#2::m");
     }
 
     #[test]
@@ -424,7 +1619,14 @@ export async function* streamUsers(): AsyncGenerator<string> {
         let entities = plugin.extract_entities(code, "stream.ts");
         let stream = entities.iter().find(|e| e.name == "streamUsers");
 
-        assert!(stream.is_some(), "Should find generator function, got: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert!(
+            stream.is_some(),
+            "Should find generator function, got: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(stream.unwrap().entity_type, "function");
     }
 
@@ -440,7 +1642,14 @@ export function* ids() {
         let entities = plugin.extract_entities(code, "ids.js");
         let ids = entities.iter().find(|e| e.name == "ids");
 
-        assert!(ids.is_some(), "Should find generator function, got: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert!(
+            ids.is_some(),
+            "Should find generator function, got: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(ids.unwrap().entity_type, "function");
     }
 
@@ -457,13 +1666,79 @@ function outer() {
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "nested.ts");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("Nested TS: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type, &e.parent_id)).collect::<Vec<_>>());
+        eprintln!(
+            "Nested TS: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                .collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"outer"), "Should find outer, got: {:?}", names);
-        assert!(names.contains(&"inner"), "Should find inner, got: {:?}", names);
+        assert!(
+            names.contains(&"outer"),
+            "Should find outer, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"inner"),
+            "Should find inner, got: {:?}",
+            names
+        );
 
         let inner = entities.iter().find(|e| e.name == "inner").unwrap();
         assert!(inner.parent_id.is_some(), "inner should have parent_id");
+    }
+
+    #[test]
+    fn test_typescript_nested_anonymous_class_fields() {
+        let code = r#"
+class L1 {
+  L2 = class {
+    L3 = class {
+      L4 = class {
+        method() { return 1; }
+      };
+    };
+  };
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "a.ts");
+        let find = |name: &str| {
+            entities.iter().find(|e| e.name == name).unwrap_or_else(|| {
+                panic!(
+                    "missing {name}; got: {:?}",
+                    entities
+                        .iter()
+                        .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                        .collect::<Vec<_>>()
+                )
+            })
+        };
+
+        let l1 = find("L1");
+        assert_eq!(l1.entity_type, "class");
+        let l1_id = l1.id.clone();
+
+        let l2 = find("L2");
+        assert_eq!(l2.entity_type, "field");
+        assert_eq!(l2.parent_id.as_deref(), Some(l1_id.as_str()));
+        let l2_id = l2.id.clone();
+
+        let l3 = find("L3");
+        assert_eq!(l3.entity_type, "field");
+        assert_eq!(l3.parent_id.as_deref(), Some(l2_id.as_str()));
+        let l3_id = l3.id.clone();
+
+        let l4 = find("L4");
+        assert_eq!(l4.entity_type, "field");
+        assert_eq!(l4.parent_id.as_deref(), Some(l3_id.as_str()));
+        let l4_id = l4.id.clone();
+
+        let method = find("method");
+        assert_eq!(method.entity_type, "method");
+        assert_eq!(method.parent_id.as_deref(), Some(l4_id.as_str()));
+        assert_eq!(method.id, "a.ts::class::L1::L2::L3::L4::method");
     }
 
     #[test]
@@ -519,12 +1794,18 @@ impl Greeting for Cat {
 "#;
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "impls.rs");
-        let impl_entities: Vec<&_> = entities.iter()
+        let impl_entities: Vec<&_> = entities
+            .iter()
             .filter(|e| e.entity_type == "impl")
             .collect();
         let names: Vec<&str> = impl_entities.iter().map(|e| e.name.as_str()).collect();
 
-        assert_eq!(impl_entities.len(), 3, "Should find 3 impl blocks, got: {:?}", names);
+        assert_eq!(
+            impl_entities.len(),
+            3,
+            "Should find 3 impl blocks, got: {:?}",
+            names
+        );
         assert!(names.contains(&"Greeting for Person"), "got: {:?}", names);
         assert!(names.contains(&"Greeting for Robot"), "got: {:?}", names);
         assert!(names.contains(&"Greeting for Cat"), "got: {:?}", names);
@@ -569,6 +1850,69 @@ impl Greeting for Cat {
     }
 
     #[test]
+    fn test_swift_renamed_operator_same_structural_hash() {
+        let plugin = CodeParserPlugin;
+        let entities_a = plugin.extract_entities("prefix operator ~~~\n", "a.swift");
+        let entities_b = plugin.extract_entities("prefix operator !!!\n", "b.swift");
+
+        assert_eq!(entities_a.len(), 1, "Should find one entity in a");
+        assert_eq!(entities_b.len(), 1, "Should find one entity in b");
+        assert_eq!(entities_a[0].name, "~~~");
+        assert_eq!(entities_b[0].name, "!!!");
+        assert_eq!(entities_a[0].entity_type, "operator");
+        assert_eq!(entities_b[0].entity_type, "operator");
+        assert_eq!(
+            entities_a[0].structural_hash, entities_b[0].structural_hash,
+            "Renamed operator with otherwise identical declaration should have same structural_hash"
+        );
+        assert_ne!(
+            entities_a[0].content_hash, entities_b[0].content_hash,
+            "Content hash should differ since raw content includes the operator token"
+        );
+    }
+
+    #[test]
+    fn test_swift_synthesized_names_disambiguate_overloads() {
+        let plugin = CodeParserPlugin;
+        let code = r#"
+struct Matrix {
+    subscript(row: Int) -> Double {
+        return Double(row)
+    }
+
+    subscript(row: Int, column: Int) -> Double {
+        return Double(row + column)
+    }
+}
+
+class Builder {
+    init(value: Int) {}
+    init(text: String) {}
+}
+"#;
+
+        let entities = plugin.extract_entities(code, "Overloads.swift");
+
+        let subscript_ids: Vec<&str> = entities
+            .iter()
+            .filter(|e| e.entity_type == "subscript")
+            .map(|e| e.id.as_str())
+            .collect();
+        assert_eq!(subscript_ids.len(), 2);
+        assert_ne!(subscript_ids[0], subscript_ids[1]);
+        assert!(subscript_ids.iter().all(|id| id.contains("@L")));
+
+        let init_ids: Vec<&str> = entities
+            .iter()
+            .filter(|e| e.entity_type == "init")
+            .map(|e| e.id.as_str())
+            .collect();
+        assert_eq!(init_ids.len(), 2);
+        assert_ne!(init_ids[0], init_ids[1]);
+        assert!(init_ids.iter().all(|id| id.contains("@L")));
+    }
+
+    #[test]
     fn test_hcl_entity_extraction() {
         let code = r#"
 region = "eu-west-1"
@@ -589,17 +1933,39 @@ resource "aws_instance" "web" {
         let entities = plugin.extract_entities(code, "main.tf");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
-        eprintln!("HCL entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type, &e.parent_id)).collect::<Vec<_>>());
+        eprintln!(
+            "HCL entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                .collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"region"), "Should find top-level attribute, got: {:?}", names);
-        assert!(names.contains(&"variable.image_id"), "Should find variable block, got: {:?}", names);
-        assert!(names.contains(&"resource.aws_instance.web"), "Should find resource block, got: {:?}", names);
+        assert!(
+            names.contains(&"region"),
+            "Should find top-level attribute, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"variable.image_id"),
+            "Should find variable block, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"resource.aws_instance.web"),
+            "Should find resource block, got: {:?}",
+            names
+        );
         assert!(
             names.contains(&"resource.aws_instance.web.lifecycle"),
             "Should find nested lifecycle block with qualified name, got: {:?}",
             names
         );
-        assert!(!names.contains(&"ami"), "Should skip nested attributes inside blocks, got: {:?}", names);
+        assert!(
+            !names.contains(&"ami"),
+            "Should skip nested attributes inside blocks, got: {:?}",
+            names
+        );
         assert!(
             !names.contains(&"create_before_destroy"),
             "Should skip nested attributes inside nested blocks, got: {:?}",
@@ -610,8 +1976,14 @@ resource "aws_instance" "web" {
             .iter()
             .find(|e| e.name == "resource.aws_instance.web.lifecycle")
             .unwrap();
-        assert!(lifecycle.parent_id.is_some(), "lifecycle should be nested under resource");
-        assert!(types.contains(&"attribute"), "Should preserve attribute entity type for top-level attributes");
+        assert!(
+            lifecycle.parent_id.is_some(),
+            "lifecycle should be nested under resource"
+        );
+        assert!(
+            types.contains(&"attribute"),
+            "Should preserve attribute entity type for top-level attributes"
+        );
     }
 
     #[test]
@@ -642,7 +2014,13 @@ fun topLevel(x: Int): Int = x * 2
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "App.kt");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("Kotlin entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        eprintln!(
+            "Kotlin entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
         assert!(names.contains(&"UserService"), "got: {:?}", names);
         assert!(names.contains(&"greet"), "got: {:?}", names);
         assert!(names.contains(&"Repository"), "got: {:?}", names);
@@ -675,7 +2053,13 @@ fun topLevel(x: Int): Int = x * 2
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "pom.xml");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("XML entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        eprintln!(
+            "XML entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
         assert!(names.contains(&"project"), "got: {:?}", names);
         assert!(names.contains(&"dependencies"), "got: {:?}", names);
         assert!(names.contains(&"build"), "got: {:?}", names);
@@ -958,6 +2342,69 @@ const handler = () => {
     }
 
     #[test]
+    fn test_js_ts_multi_declarator_promotes_each_const_initializer() {
+        let code = r#"
+const value = 1, handler = () => value;
+const first = () => 1, second = 2;
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "sample.ts");
+        let find = |name: &str| {
+            entities.iter().find(|e| e.name == name).unwrap_or_else(|| {
+                panic!(
+                    "missing {name}; got: {:?}",
+                    entities
+                        .iter()
+                        .map(|e| (&e.name, &e.entity_type))
+                        .collect::<Vec<_>>()
+                )
+            })
+        };
+
+        assert_eq!(find("value").entity_type, "variable");
+        assert_eq!(find("handler").entity_type, "function");
+        assert_eq!(find("first").entity_type, "function");
+        assert_eq!(find("second").entity_type, "variable");
+    }
+
+    #[test]
+    fn test_suppressed_multi_declarator_traverses_skipped_initializers() {
+        let code = r#"
+function wrapper() {
+  const holder = class {
+    run() { return 1; }
+  }, handler = () => {
+    class Inner {
+      go() { return 2; }
+    }
+  }, value = 1;
+}
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "sample.ts");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        let find = |name: &str| {
+            entities.iter().find(|e| e.name == name).unwrap_or_else(|| {
+                panic!(
+                    "missing {name}; got: {:?}",
+                    entities
+                        .iter()
+                        .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                        .collect::<Vec<_>>()
+                )
+            })
+        };
+
+        assert_eq!(find("wrapper").entity_type, "function");
+        assert_eq!(find("handler").entity_type, "function");
+        assert!(names.contains(&"run"), "got: {:?}", names);
+        assert!(names.contains(&"Inner"), "got: {:?}", names);
+        assert!(names.contains(&"go"), "got: {:?}", names);
+        assert!(!names.contains(&"holder"), "got: {:?}", names);
+        assert!(!names.contains(&"value"), "got: {:?}", names);
+    }
+
+    #[test]
     fn test_go_var_declaration() {
         let code = r#"package featuremgmt
 
@@ -983,11 +2430,26 @@ func GetFlags() []FeatureFlag {
         let entities = plugin.extract_entities(code, "flags.go");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
-        eprintln!("Go entities: {:?}", names.iter().zip(types.iter()).collect::<Vec<_>>());
+        eprintln!(
+            "Go entities: {:?}",
+            names.iter().zip(types.iter()).collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"FeatureFlag"), "Should find type FeatureFlag, got: {:?}", names);
-        assert!(names.contains(&"standardFeatureFlags"), "Should find var standardFeatureFlags, got: {:?}", names);
-        assert!(names.contains(&"GetFlags"), "Should find func GetFlags, got: {:?}", names);
+        assert!(
+            names.contains(&"FeatureFlag"),
+            "Should find type FeatureFlag, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"standardFeatureFlags"),
+            "Should find var standardFeatureFlags, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"GetFlags"),
+            "Should find func GetFlags, got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -1010,11 +2472,26 @@ func main() {}
         let entities = plugin.extract_entities(code, "test.go");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
         let types: Vec<&str> = entities.iter().map(|e| e.entity_type.as_str()).collect();
-        eprintln!("Go grouped entities: {:?}", names.iter().zip(types.iter()).collect::<Vec<_>>());
+        eprintln!(
+            "Go grouped entities: {:?}",
+            names.iter().zip(types.iter()).collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"flags") || names.contains(&"simple"), "Should find grouped var, got: {:?}", names);
-        assert!(names.contains(&"x"), "Should find grouped const x, got: {:?}", names);
-        assert!(names.contains(&"main"), "Should find func main, got: {:?}", names);
+        assert!(
+            names.contains(&"flags") || names.contains(&"simple"),
+            "Should find grouped var, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"x"),
+            "Should find grouped const x, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"main"),
+            "Should find func main, got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -1085,30 +2562,77 @@ extension type Wrapper(int value) implements int {}
         );
 
         // Top-level declarations
-        assert!(names.contains(&"Calculator"), "Should find class, got: {:?}", names);
-        assert!(names.contains(&"Loggable"), "Should find mixin, got: {:?}", names);
-        assert!(names.contains(&"StringExt"), "Should find extension, got: {:?}", names);
-        assert!(names.contains(&"Status"), "Should find enum, got: {:?}", names);
-        assert!(names.contains(&"Callback"), "Should find typedef, got: {:?}", names);
-        assert!(names.contains(&"add"), "Should find top-level function, got: {:?}", names);
-        assert!(names.contains(&"Wrapper"), "Should find extension type, got: {:?}", names);
+        assert!(
+            names.contains(&"Calculator"),
+            "Should find class, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Loggable"),
+            "Should find mixin, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"StringExt"),
+            "Should find extension, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Status"),
+            "Should find enum, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Callback"),
+            "Should find typedef, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"add"),
+            "Should find top-level function, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Wrapper"),
+            "Should find extension type, got: {:?}",
+            names
+        );
 
         // Class members with correct types
-        let add_method = entities.iter().find(|e| e.name == "add" && e.parent_id.is_some());
-        assert!(add_method.is_some(), "Should find add method inside Calculator");
+        let add_method = entities
+            .iter()
+            .find(|e| e.name == "add" && e.parent_id.is_some());
+        assert!(
+            add_method.is_some(),
+            "Should find add method inside Calculator"
+        );
         assert_eq!(add_method.unwrap().entity_type, "method");
 
         // Named constructor gets distinct name from unnamed constructor
-        let unnamed_ctor = entities.iter().find(|e| e.name == "Calculator" && e.entity_type == "constructor");
+        let unnamed_ctor = entities
+            .iter()
+            .find(|e| e.name == "Calculator" && e.entity_type == "constructor");
         assert!(unnamed_ctor.is_some(), "Should find unnamed constructor");
         let named_ctor = entities.iter().find(|e| e.name == "Calculator.withDefault");
-        assert!(named_ctor.is_some(), "Should find named constructor Calculator.withDefault, got: {:?}", names);
+        assert!(
+            named_ctor.is_some(),
+            "Should find named constructor Calculator.withDefault, got: {:?}",
+            names
+        );
         assert_eq!(named_ctor.unwrap().entity_type, "constructor");
-        assert_ne!(unnamed_ctor.unwrap().id, named_ctor.unwrap().id, "Named and unnamed constructors must have different entity IDs");
+        assert_ne!(
+            unnamed_ctor.unwrap().id,
+            named_ctor.unwrap().id,
+            "Named and unnamed constructors must have different entity IDs"
+        );
 
         // Factory constructor
         let factory_ctor = entities.iter().find(|e| e.name == "Calculator.create");
-        assert!(factory_ctor.is_some(), "Should find factory constructor Calculator.create, got: {:?}", names);
+        assert!(
+            factory_ctor.is_some(),
+            "Should find factory constructor Calculator.create, got: {:?}",
+            names
+        );
         assert_eq!(factory_ctor.unwrap().entity_type, "constructor");
 
         // Getter, setter, operator
@@ -1127,7 +2651,10 @@ extension type Wrapper(int value) implements int {}
         // Mixin members have parent
         let log_method = entities.iter().find(|e| e.name == "log");
         assert!(log_method.is_some(), "Should find log in Loggable");
-        assert!(log_method.unwrap().parent_id.is_some(), "log should have parent_id");
+        assert!(
+            log_method.unwrap().parent_id.is_some(),
+            "log should have parent_id"
+        );
 
         // Entity type mapping
         let callback = entities.iter().find(|e| e.name == "Callback").unwrap();
@@ -1141,6 +2668,59 @@ extension type Wrapper(int value) implements int {}
 
         let wrapper = entities.iter().find(|e| e.name == "Wrapper").unwrap();
         assert_eq!(wrapper.entity_type, "extension");
+    }
+
+    #[test]
+    #[cfg(feature = "lang-sql")]
+    fn test_sql_entity_extraction() {
+        let code = r#"
+CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
+CREATE VIEW active_users AS SELECT * FROM users WHERE active;
+CREATE FUNCTION add(a INT, b INT) RETURNS INT AS $$ BEGIN RETURN a + b; END; $$ LANGUAGE plpgsql;
+CREATE INDEX idx_name ON users(name);
+CREATE TYPE mood AS ENUM ('sad', 'happy');
+CREATE SCHEMA myapp;
+CREATE MATERIALIZED VIEW mv AS SELECT 1;
+CREATE TABLE billing.invoices (id INT);
+"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "schema.sql");
+        let by_name = |n: &str| entities.iter().find(|e| e.name == n);
+
+        // object_reference names (incl. schema-qualified)
+        assert_eq!(
+            by_name("users").map(|e| e.entity_type.as_str()),
+            Some("table")
+        );
+        assert_eq!(
+            by_name("active_users").map(|e| e.entity_type.as_str()),
+            Some("view")
+        );
+        assert_eq!(
+            by_name("add").map(|e| e.entity_type.as_str()),
+            Some("function")
+        );
+        assert_eq!(
+            by_name("mood").map(|e| e.entity_type.as_str()),
+            Some("type")
+        );
+        assert_eq!(by_name("mv").map(|e| e.entity_type.as_str()), Some("view"));
+        assert_eq!(
+            by_name("billing.invoices").map(|e| e.entity_type.as_str()),
+            Some("table"),
+            "schema-qualified table name should be preserved"
+        );
+
+        // CREATE INDEX / SCHEMA name a bare identifier, not the ON-table
+        assert_eq!(
+            by_name("idx_name").map(|e| e.entity_type.as_str()),
+            Some("index"),
+            "index should be named idx_name, not the table it indexes"
+        );
+        assert_eq!(
+            by_name("myapp").map(|e| e.entity_type.as_str()),
+            Some("schema")
+        );
     }
 
     #[test]
@@ -1219,7 +2799,10 @@ class Foo {
         let entities_a = plugin.extract_entities(code_a, "a.dart");
         let entities_b = plugin.extract_entities(code_b, "b.dart");
 
-        let ctor_a = entities_a.iter().find(|e| e.name == "Foo.fromJson").unwrap();
+        let ctor_a = entities_a
+            .iter()
+            .find(|e| e.name == "Foo.fromJson")
+            .unwrap();
         let ctor_b = entities_b.iter().find(|e| e.name == "Foo.fromMap").unwrap();
 
         assert_eq!(
@@ -1255,21 +2838,40 @@ set currentValue(int v) {
                 .collect::<Vec<_>>()
         );
 
-        let getter = entities.iter().find(|e| e.name == "currentValue" && e.entity_type == "getter");
-        assert!(getter.is_some(), "Should find top-level getter, got: {:?}",
-            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        let getter = entities
+            .iter()
+            .find(|e| e.name == "currentValue" && e.entity_type == "getter");
+        assert!(
+            getter.is_some(),
+            "Should find top-level getter, got: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
         assert!(
             getter.unwrap().content.contains("return _value"),
             "Top-level getter content should include the body"
         );
-        assert!(getter.unwrap().parent_id.is_none(), "Top-level getter should have no parent");
+        assert!(
+            getter.unwrap().parent_id.is_none(),
+            "Top-level getter should have no parent"
+        );
 
-        // tree-sitter-dart 0.1.0 parses top-level setters as function_signature
+        // tree-sitter-dart 0.2.0 parses top-level setters as function_signature
         // (treating `set` as a type_identifier). setter_signature is only
         // produced inside class_member → method_signature.
-        let setter = entities.iter().find(|e| e.name == "currentValue" && e.entity_type == "function");
-        assert!(setter.is_some(), "Should find top-level setter as function, got: {:?}",
-            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        let setter = entities
+            .iter()
+            .find(|e| e.name == "currentValue" && e.entity_type == "function");
+        assert!(
+            setter.is_some(),
+            "Should find top-level setter as function, got: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
         assert!(
             setter.unwrap().content.contains("_value = v"),
             "Top-level setter content should include the body"
@@ -1294,14 +2896,28 @@ class Config {
                 .collect::<Vec<_>>()
         );
 
-        let name_field = entities.iter().find(|e| e.name == "name" && e.parent_id.is_some());
-        assert!(name_field.is_some(), "Should find field 'name', got: {:?}",
-            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        let name_field = entities
+            .iter()
+            .find(|e| e.name == "name" && e.parent_id.is_some());
+        assert!(
+            name_field.is_some(),
+            "Should find field 'name', got: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(name_field.unwrap().entity_type, "field");
 
         let max_retries = entities.iter().find(|e| e.name == "maxRetries");
-        assert!(max_retries.is_some(), "Should find field 'maxRetries', got: {:?}",
-            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert!(
+            max_retries.is_some(),
+            "Should find field 'maxRetries', got: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(max_retries.unwrap().entity_type, "field");
     }
 
@@ -1327,14 +2943,29 @@ abstract class Shape {
         );
 
         let x_field = entities.iter().find(|e| e.name == "x");
-        assert!(x_field.is_some(), "Should find field 'x' from identifier_list, got: {:?}",
-            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert!(
+            x_field.is_some(),
+            "Should find field 'x' from identifier_list, got: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(x_field.unwrap().entity_type, "field");
-        assert!(x_field.unwrap().parent_id.is_some(), "field 'x' should be nested under Shape");
+        assert!(
+            x_field.unwrap().parent_id.is_some(),
+            "field 'x' should be nested under Shape"
+        );
 
         let label_field = entities.iter().find(|e| e.name == "label");
-        assert!(label_field.is_some(), "Should find field 'label' from single-element identifier_list, got: {:?}",
-            entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        assert!(
+            label_field.is_some(),
+            "Should find field 'label' from single-element identifier_list, got: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(label_field.unwrap().entity_type, "field");
     }
 
@@ -1385,10 +3016,20 @@ end
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "example.ml");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("OCaml entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        eprintln!(
+            "OCaml entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
 
-        let find = |name: &str| entities.iter().find(|e| e.name == name)
-            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+        let find = |name: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names))
+        };
 
         assert_eq!(find("color").entity_type, "type");
         assert_eq!(find("point").entity_type, "type");
@@ -1419,10 +3060,20 @@ end
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "nested.ml");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("OCaml nested: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type, &e.parent_id)).collect::<Vec<_>>());
+        eprintln!(
+            "OCaml nested: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                .collect::<Vec<_>>()
+        );
 
-        let find = |name: &str| entities.iter().find(|e| e.name == name)
-            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+        let find = |name: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names))
+        };
 
         let outer = find("Outer");
         let x = find("x");
@@ -1434,9 +3085,18 @@ end
         assert_eq!(inner.entity_type, "module");
         assert_eq!(y.entity_type, "value");
 
-        assert!(x.parent_id.as_ref().is_some_and(|p| p == &outer.id), "x should be nested under Outer");
-        assert!(inner.parent_id.as_ref().is_some_and(|p| p == &outer.id), "Inner should be nested under Outer");
-        assert!(y.parent_id.as_ref().is_some_and(|p| p == &inner.id), "y should be nested under Inner");
+        assert!(
+            x.parent_id.as_ref().is_some_and(|p| p == &outer.id),
+            "x should be nested under Outer"
+        );
+        assert!(
+            inner.parent_id.as_ref().is_some_and(|p| p == &outer.id),
+            "Inner should be nested under Outer"
+        );
+        assert!(
+            y.parent_id.as_ref().is_some_and(|p| p == &inner.id),
+            "y should be nested under Inner"
+        );
     }
 
     #[test]
@@ -1456,10 +3116,20 @@ end
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "example.mli");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("OCaml interface entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        eprintln!(
+            "OCaml interface entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
 
-        let find = |name: &str| entities.iter().find(|e| e.name == name)
-            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+        let find = |name: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names))
+        };
 
         assert_eq!(find("t").entity_type, "type");
         assert_eq!(find("create").entity_type, "val");
@@ -1480,10 +3150,20 @@ and pong x = if x <= 0 then 0 else ping (x - 1)
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "mutual.ml");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("OCaml mutual let: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        eprintln!(
+            "OCaml mutual let: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
 
-        let find = |name: &str| entities.iter().find(|e| e.name == name)
-            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+        let find = |name: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names))
+        };
 
         assert_eq!(find("even").entity_type, "function");
         assert_eq!(find("odd").entity_type, "function");
@@ -1504,10 +3184,20 @@ end
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "mutual_mod.ml");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("OCaml mutual module: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type, &e.parent_id)).collect::<Vec<_>>());
+        eprintln!(
+            "OCaml mutual module: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type, &e.parent_id))
+                .collect::<Vec<_>>()
+        );
 
-        let find = |name: &str| entities.iter().find(|e| e.name == name)
-            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+        let find = |name: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names))
+        };
 
         let a = find("A");
         let b = find("B");
@@ -1516,8 +3206,14 @@ end
 
         let x = find("x");
         let y = find("y");
-        assert!(x.parent_id.as_ref().is_some_and(|p| p == &a.id), "x should be nested under A");
-        assert!(y.parent_id.as_ref().is_some_and(|p| p == &b.id), "y should be nested under B");
+        assert!(
+            x.parent_id.as_ref().is_some_and(|p| p == &a.id),
+            "x should be nested under A"
+        );
+        assert!(
+            y.parent_id.as_ref().is_some_and(|p| p == &b.id),
+            "y should be nested under B"
+        );
     }
 
     #[test]
@@ -1532,10 +3228,20 @@ let simple = 42
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "destruct.ml");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("OCaml destructured: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        eprintln!(
+            "OCaml destructured: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
 
-        let find = |name: &str| entities.iter().find(|e| e.name == name)
-            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+        let find = |name: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names))
+        };
 
         assert_eq!(find("a").entity_type, "value");
         assert_eq!(find("b").entity_type, "value");
@@ -1557,10 +3263,20 @@ end
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "classes.ml");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("OCaml mutual class: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        eprintln!(
+            "OCaml mutual class: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
 
-        let find = |name: &str| entities.iter().find(|e| e.name == name)
-            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+        let find = |name: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names))
+        };
 
         assert_eq!(find("foo").entity_type, "class");
         assert_eq!(find("bar").entity_type, "class");
@@ -1592,8 +3308,12 @@ sub _private_helper {
         assert!(names.contains(&"hello"), "got: {:?}", names);
         assert!(names.contains(&"_private_helper"), "got: {:?}", names);
 
-        let find = |name: &str| entities.iter().find(|e| e.name == name)
-            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+        let find = |name: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names))
+        };
 
         assert_eq!(find("Foo::Bar").entity_type, "package");
         assert_eq!(find("hello").entity_type, "function");
@@ -1630,8 +3350,12 @@ end program main
         assert!(names.contains(&"greet"), "got: {:?}", names);
         assert!(names.contains(&"main"), "got: {:?}", names);
 
-        let find = |name: &str| entities.iter().find(|e| e.name == name)
-            .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names));
+        let find = |name: &str| {
+            entities
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("Should find {}, got: {:?}", name, names))
+        };
 
         assert_eq!(find("math_utils").entity_type, "module");
         assert_eq!(find("add").entity_type, "function");
@@ -1676,16 +3400,41 @@ type UserId = String
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "UserService.scala");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("Scala entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        eprintln!(
+            "Scala entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"UserService"), "Should find class UserService, got: {:?}", names);
-        assert!(names.contains(&"Repository"), "Should find trait Repository, got: {:?}", names);
-        assert!(names.contains(&"getUsers"), "Should find method getUsers, got: {:?}", names);
-        assert!(names.contains(&"createUser"), "Should find method createUser, got: {:?}", names);
+        assert!(
+            names.contains(&"UserService"),
+            "Should find class UserService, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Repository"),
+            "Should find trait Repository, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"getUsers"),
+            "Should find method getUsers, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"createUser"),
+            "Should find method createUser, got: {:?}",
+            names
+        );
 
         // Methods should be nested under class
         let get_users = entities.iter().find(|e| e.name == "getUsers").unwrap();
-        assert!(get_users.parent_id.is_some(), "getUsers should have parent_id");
+        assert!(
+            get_users.parent_id.is_some(),
+            "getUsers should have parent_id"
+        );
     }
 
     #[test]
@@ -1718,13 +3467,39 @@ type Predicate[A] = A => Boolean
         let plugin = CodeParserPlugin;
         let entities = plugin.extract_entities(code, "Main.scala");
         let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
-        eprintln!("Scala 3 entities: {:?}", entities.iter().map(|e| (&e.name, &e.entity_type)).collect::<Vec<_>>());
+        eprintln!(
+            "Scala 3 entities: {:?}",
+            entities
+                .iter()
+                .map(|e| (&e.name, &e.entity_type))
+                .collect::<Vec<_>>()
+        );
 
-        assert!(names.contains(&"Color"), "Should find enum Color, got: {:?}", names);
-        assert!(names.contains(&"Planet"), "Should find enum Planet, got: {:?}", names);
-        assert!(names.contains(&"Main"), "Should find object Main, got: {:?}", names);
-        assert!(names.contains(&"Greeter"), "Should find trait Greeter, got: {:?}", names);
-        assert!(names.contains(&"Predicate"), "Should find type alias Predicate, got: {:?}", names);
+        assert!(
+            names.contains(&"Color"),
+            "Should find enum Color, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Planet"),
+            "Should find enum Planet, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Main"),
+            "Should find object Main, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Greeter"),
+            "Should find trait Greeter, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Predicate"),
+            "Should find type alias Predicate, got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -1773,17 +3548,115 @@ test "basic addition" {
             .map(|e| (e.name.as_str(), e.entity_type.as_str()))
             .collect();
 
-        assert!(names.contains(&"greet"), "Should find greet, got: {:?}", names);
+        assert!(
+            names.contains(&"greet"),
+            "Should find greet, got: {:?}",
+            names
+        );
         assert!(names.contains(&"add"), "Should find add, got: {:?}", names);
-        assert!(names.contains(&"main"), "Should find main, got: {:?}", names);
-        assert!(names.contains(&"Point"), "Should find Point, got: {:?}", names);
-        assert!(names.contains(&"Color"), "Should find Color, got: {:?}", names);
-        assert!(names.contains(&"Person"), "Should find Person, got: {:?}", names);
+        assert!(
+            names.contains(&"main"),
+            "Should find main, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Point"),
+            "Should find Point, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Color"),
+            "Should find Color, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"Person"),
+            "Should find Person, got: {:?}",
+            names
+        );
 
         assert_eq!(types["greet"], "function");
         assert_eq!(types["add"], "function");
         assert_eq!(types["Point"], "struct");
         assert_eq!(types["Color"], "enum");
         assert_eq!(types["Person"], "struct");
+    }
+
+    #[test]
+    #[cfg(feature = "lang-edn")]
+    fn test_edn_deps_edn_map_entries() {
+        let code = r#"{:deps {org.clojure/clojure {:mvn/version "1.11.0"}}
+ :paths ["src" "resources"]
+ :aliases {:dev {:extra-deps {cider/cider-nrepl {:mvn/version "0.28.5"}}}}}"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "deps.edn");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+        let types: std::collections::HashMap<&str, &str> = entities
+            .iter()
+            .map(|e| (e.name.as_str(), e.entity_type.as_str()))
+            .collect();
+
+        assert!(
+            names.contains(&":deps"),
+            "Should find :deps, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&":paths"),
+            "Should find :paths, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&":aliases"),
+            "Should find :aliases, got: {:?}",
+            names
+        );
+        assert_eq!(
+            names.len(),
+            3,
+            "Should have exactly 3 entries, got: {:?}",
+            names
+        );
+        assert_eq!(types[":deps"], "entry");
+        assert_eq!(types[":paths"], "entry");
+        assert_eq!(types[":aliases"], "entry");
+    }
+
+    #[test]
+    #[cfg(feature = "lang-edn")]
+    fn test_edn_nested_map_values_not_extracted() {
+        // Inner map entries (inside :aliases) must not leak as top-level entities.
+        let code = r#"{:a {:b 1 :c 2} :d 3}"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "config.edn");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains(&":a"), "Should find :a, got: {:?}", names);
+        assert!(names.contains(&":d"), "Should find :d, got: {:?}", names);
+        assert!(!names.contains(&":b"), "Inner :b should not be extracted");
+        assert!(!names.contains(&":c"), "Inner :c should not be extracted");
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    #[cfg(feature = "lang-edn")]
+    fn test_edn_non_map_top_level_forms_not_extracted() {
+        // A bare vector at the top level has no meaningful name and yields no entities.
+        let code = r#"["alpha" "beta"]"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "data.edn");
+        assert_eq!(entities.len(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "lang-edn")]
+    fn test_edn_symbol_keys_extracted() {
+        let code = r#"{foo 1 bar 2}"#;
+        let plugin = CodeParserPlugin;
+        let entities = plugin.extract_entities(code, "sym.edn");
+        let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(names.contains(&"foo"), "Should find foo, got: {:?}", names);
+        assert!(names.contains(&"bar"), "Should find bar, got: {:?}", names);
     }
 }

@@ -57,6 +57,7 @@ sem graph
 sem graph --entity validateToken
 sem graph --file-exts .py
 sem graph --format json
+sem graph --no-default-excludes
 ```
 
 ### sem impact
@@ -66,11 +67,12 @@ Transitive impact analysis. If this entity changes, what else is affected? BFS t
 sem impact validateToken
 sem impact validateToken --json
 sem impact validateToken --file-exts .py
+sem impact validateToken --no-default-excludes
 ```
 
 ## Key Features
 
-- 26 languages with full entity extraction via tree-sitter
+- 27 languages with full entity extraction via tree-sitter
 - Structural hashing: AST-normalized hashes that ignore whitespace, comments, formatting
 - Cosmetic vs structural change detection in diff
 - Entity-level blame (per function, not per line)
@@ -82,7 +84,7 @@ sem impact validateToken --file-exts .py
 
 ## Language Support
 
-26 programming languages:
+27 programming languages:
 
 | Language | Extensions | Entity Types |
 |----------|-----------|--------------|
@@ -111,6 +113,7 @@ sem impact validateToken --file-exts .py
 | Perl | .pl .pm .t | subroutines, packages |
 | OCaml | .ml .mli | values, modules, types, classes, externals |
 | Scala | .scala .sc .sbt | classes, objects, traits, enums, functions, vals, extensions |
+| Nix | .nix | bindings, inherit declarations |
 | Zig | .zig | functions, tests, variables |
 
 Plus structured data formats:
@@ -134,18 +137,24 @@ sem diff --format json
 Returns:
 ```json
 {
-  "summary": { "fileCount": 2, "added": 1, "modified": 1, "deleted": 1, "total": 3 },
+  "summary": { "fileCount": 2, "added": 1, "modified": 1, "deleted": 1, "moved": 0, "renamed": 0, "reordered": 0, "orphan": 0, "total": 3 },
   "changes": [
     {
       "entityId": "src/auth.ts::function::validateToken",
       "changeType": "added",
       "entityType": "function",
       "entityName": "validateToken",
+      "startLine": 12,
+      "endLine": 18,
+      "oldStartLine": null,
+      "oldEndLine": null,
       "filePath": "src/auth.ts"
     }
   ]
 }
 ```
+
+The named change-type buckets (added, modified, deleted, moved, renamed, reordered) always sum to total. Orphan is metadata for module-level changes already included in those buckets.
 
 ## Architecture
 

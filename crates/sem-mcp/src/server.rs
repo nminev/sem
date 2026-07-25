@@ -1,5 +1,7 @@
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::fs::File;
 use std::hash::{Hash, Hasher};
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -8,19 +10,55 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use sem_core::format::json::format_diff_json_with_binary_changes;
 use sem_core::git::bridge::GitBridge;
-use sem_core::git::types::DiffScope;
+use sem_core::git::types::{BlameLineInfo, CommitInfo, DiffScope};
 use sem_core::model::entity::SemanticEntity;
-use sem_core::parser::differ::compute_semantic_diff;
+use sem_core::parser::differ::{collect_binary_file_changes, compute_semantic_diff};
 use sem_core::parser::graph::EntityGraph;
 use sem_core::parser::plugins::create_default_registry;
 use sem_core::parser::registry::ParserRegistry;
+use sem_core::utils::scan::{is_default_excluded, is_probably_binary_path};
+use std::time::Instant;
 use tokio::sync::Mutex;
 
 use crate::cache;
 use crate::tools::*;
+use crate::watch::{watch_enabled, RepoWatcher};
+
+const MCP_INSTRUCTIONS: &str = "sem: entity-level code intelligence \
+    (functions/classes/methods plus a real cross-file call and import graph). \
+    Prefer these over grep/find for structural questions:\n\
+    - \"what calls X / what breaks if I change X\" -> sem_impact (not grep)\n\
+    - \"read / understand the function or class X\" -> sem_context (returns X's full source PLUS its callers and callees, addressed by name, not by line range; use this instead of opening the file to read code)\n\
+    - \"find where a string/symbol appears\" -> sem_entities with `text` (exact-substring search over entity bodies; hits are entities, not line numbers)\n\
+    - \"list the entities in this file/dir\" -> sem_entities with a `path`\n\
+    - entity-level change review -> sem_diff; who last changed X -> sem_blame; how X evolved -> sem_log\n\
+    Use grep/find only for text/string search, error messages, config keys, \
+    discovery by an unknown name, and non-code files. Open/read a source file \
+    directly only to edit it (editors require reading the file first) or for \
+    non-code/config; to merely understand code, sem_context is faster and arrives \
+    with the dependency context. sem is deterministic and cross-file, so it won't \
+    hallucinate edges or miss callers the way a text search does.\n\
+    Make the leverage felt. sem_context and sem_impact return `elapsed_ms` (and \
+    `source`: local or cloud) — the real latency you waited on. When one sem call \
+    replaces several grep/read steps or catches what text search can't, say so in \
+    ONE terse, factual clause, e.g. \"(sem_impact: 9ms, 2 transitive callers grep \
+    would miss)\" or \"(sem_context: 7ms, body + 3 deps, no files opened)\". Once \
+    per non-obvious win, never a sales pitch. Default to sem for structural work; \
+    if you fall back to grep/read on a structural question, say why.";
+
+const ENTITY_LOOKUP_CANDIDATE_LIMIT: usize = 10;
 
 /// Lazily-initialized repo context.
+/// sem_log params after the optional entity has been resolved to a concrete
+/// name (the analytics branch handles the None case before this is built).
+struct ResolvedLogParams {
+    entity_name: String,
+    file_path: Option<String>,
+    limit: Option<usize>,
+}
+
 struct RepoContext {
     git: GitBridge,
     repo_root: PathBuf,
@@ -35,11 +73,53 @@ fn content_hash_u64(content: &str) -> u64 {
     hasher.finish()
 }
 
+const BINARY_PROBE_BYTES: usize = 4096;
+
+fn has_nul_byte(path: &Path) -> std::io::Result<bool> {
+    let mut file = File::open(path)?;
+    let mut buffer = [0; BINARY_PROBE_BYTES];
+    let len = file.read(&mut buffer)?;
+    Ok(buffer[..len].contains(&0))
+}
+
 /// Cached entity graph + all entities, keyed by manifest hash.
 struct CachedGraph {
     manifest_hash: u64,
     graph: Arc<EntityGraph>,
     entities: Arc<Vec<SemanticEntity>>,
+}
+
+struct CachedTopology {
+    manifest_hash: u64,
+    graph: Arc<EntityGraph>,
+}
+
+/// Live-watch bookkeeping for whole-repo graph queries. Lets `sem_impact` and
+/// `sem_context` serve a hot cached graph without re-walking + re-stat-ing the
+/// tree when nothing has changed since the last build.
+struct WatchSlot {
+    /// The OS file watcher. `None` until first use; stays `None` if disabled.
+    watcher: Option<RepoWatcher>,
+    /// False once we've decided not to watch (disabled or failed to start).
+    enabled: bool,
+    /// Whether the in-memory graph has been built at least once.
+    built_once: bool,
+    /// Change generation captured at the last build.
+    last_built_generation: u64,
+    /// Current whole-repo source file list (input to the graph build).
+    file_paths: Vec<String>,
+}
+
+impl Default for WatchSlot {
+    fn default() -> Self {
+        Self {
+            watcher: None,
+            enabled: true,
+            built_once: false,
+            last_built_generation: 0,
+            file_paths: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -48,16 +128,28 @@ pub struct SemServer {
     registry: Arc<ParserRegistry>,
     entity_cache: Arc<Mutex<EntityCache>>,
     graph_cache: Arc<Mutex<Option<CachedGraph>>>,
-    tool_router: ToolRouter<Self>,
+    topology_cache: Arc<Mutex<Option<CachedTopology>>>,
+    watch: Arc<Mutex<WatchSlot>>,
+    /// Attention ledger: per-session record of context fills already emitted
+    /// (key: session\0entity_id). A re-ask whose fingerprint matches collapses
+    /// to a one-line "unchanged" answer; a re-ask for a CHANGED entity answers
+    /// with an entity-level delta against the version the session saw. The
+    /// body (or its previous version) is already in the asking model's context.
+    fill_ledger: Arc<Mutex<LruCache<String, LedgerFill>>>,
+    _tool_router: ToolRouter<Self>,
 }
 
 impl SemServer {
-    fn discover_repo_root(file_path_hint: Option<&str>) -> Result<PathBuf, String> {
+    pub fn discover_repo_root(file_path_hint: Option<&str>) -> Result<PathBuf, String> {
         // Strategy 1: Absolute file path -> GitBridge::open on parent dir
         if let Some(fp) = file_path_hint {
             let p = Path::new(fp);
             if p.is_absolute() {
-                let search_dir = if p.is_dir() { p } else { p.parent().unwrap_or(p) };
+                let search_dir = if p.is_dir() {
+                    p
+                } else {
+                    p.parent().unwrap_or(p)
+                };
                 if let Ok(bridge) = GitBridge::open(search_dir) {
                     return Ok(bridge.repo_root().to_path_buf());
                 }
@@ -79,25 +171,30 @@ impl SemServer {
             }
         }
 
-        Err(
-            "Cannot find git repository. Either:\n\
+        Err("Cannot find git repository. Either:\n\
              - Pass an absolute file path\n\
              - Set SEM_REPO env var to the repo root\n\
              - Run sem-mcp from within a git repo"
-                .to_string(),
-        )
+            .to_string())
     }
 
     fn resolve_file_path(repo_root: &Path, file_path: &str) -> (String, PathBuf) {
         let p = Path::new(file_path);
         if p.is_absolute() {
-            let relative = p
+            let relative_path = p
                 .strip_prefix(repo_root)
-                .map(|r| r.to_string_lossy().to_string())
-                .unwrap_or_else(|_| file_path.to_string());
+                .ok()
+                .map(Path::to_path_buf)
+                .or_else(|| canonical_relative_path(repo_root, p))
+                .map(|path| normalize_relative_path(&path));
+            let relative = relative_path
+                .map(|r| path_to_slash(&r))
+                .unwrap_or_else(|| file_path.replace('\\', "/"));
             (relative, p.to_path_buf())
         } else {
-            (file_path.to_string(), repo_root.join(file_path))
+            let abs_path = repo_root.join(file_path);
+            let relative_path = normalize_relative_path(p);
+            (path_to_slash(&relative_path), abs_path)
         }
     }
 
@@ -105,15 +202,45 @@ impl SemServer {
         &self,
         file_path_hint: Option<&str>,
     ) -> Result<tokio::sync::MappedMutexGuard<'_, RepoContext>, String> {
-        {
-            let mut guard = self.context.lock().await;
-            if guard.is_none() {
-                let repo_root = Self::discover_repo_root(file_path_hint)?;
-                let git = GitBridge::open(&repo_root)
-                    .map_err(|e| format!("Failed to open git repo: {}", e))?;
+        // An explicit absolute file hint identifies a repo, so the agent can move
+        // between repos mid-session. Without one we keep the active repo rather
+        // than snapping back to the CWD repo on every hint-less call (e.g. a
+        // whole-repo `sem_entities .`). Resolve the hint's root before locking —
+        // it touches git/the filesystem and shouldn't hold the context mutex.
+        let explicit_root: Option<PathBuf> = match file_path_hint {
+            Some(fp) if Path::new(fp).is_absolute() => Some(Self::discover_repo_root(Some(fp))?),
+            _ => None,
+        };
+
+        let switch_to: Option<PathBuf> = {
+            let guard = self.context.lock().await;
+            match (guard.as_ref(), explicit_root) {
+                // Active repo, hint points elsewhere -> switch.
+                (Some(ctx), Some(root)) if ctx.repo_root != root => Some(root),
+                // Active repo, same root or no hint -> keep it.
+                (Some(_), _) => None,
+                // First call with a hint.
+                (None, Some(root)) => Some(root),
+                // First call, no hint -> discover from env/CWD.
+                (None, None) => Some(Self::discover_repo_root(file_path_hint)?),
+            }
+        };
+
+        if let Some(repo_root) = switch_to {
+            let git = GitBridge::open(&repo_root)
+                .map_err(|e| format!("Failed to open git repo: {}", e))?;
+            {
+                let mut guard = self.context.lock().await;
                 *guard = Some(RepoContext { git, repo_root });
             }
+            // The graph, topology, and watch slots each hold a single repo's
+            // state. Switching repos invalidates them so they rebuild against the
+            // new root instead of silently answering from the previous repo.
+            *self.graph_cache.lock().await = None;
+            *self.topology_cache.lock().await = None;
+            *self.watch.lock().await = WatchSlot::default();
         }
+
         let guard = self.context.lock().await;
         Ok(tokio::sync::MutexGuard::map(guard, |opt| {
             opt.as_mut().unwrap()
@@ -121,48 +248,127 @@ impl SemServer {
     }
 
     fn find_supported_files(root: &Path, registry: &ParserRegistry) -> Result<Vec<String>, String> {
+        Self::find_supported_files_with_options(root, registry, false)
+    }
+
+    fn find_supported_files_with_options(
+        root: &Path,
+        registry: &ParserRegistry,
+        no_default_excludes: bool,
+    ) -> Result<Vec<String>, String> {
+        if !root.exists() {
+            return Err(format!(
+                "Failed to read directory {}: No such file or directory",
+                root.display()
+            ));
+        }
         let mut files = Vec::new();
-        Self::walk_dir(root, root, registry, &mut files)?;
+        let mut builder = ignore::WalkBuilder::new(root);
+        builder
+            .hidden(true)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true);
+        let semignore = root.join(".semignore");
+        if semignore.exists() {
+            builder.add_ignore(semignore);
+        }
+        Self::prune_default_excluded_dirs(&mut builder, root, no_default_excludes);
+        let walker = builder.build();
+        for entry in walker.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if let Ok(rel) = path.strip_prefix(root) {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                if (!no_default_excludes && is_default_excluded(&rel_str))
+                    || is_probably_binary_path(&rel_str)
+                {
+                    continue;
+                }
+                if registry.get_plugin(&rel_str).is_none() {
+                    continue;
+                }
+                if has_nul_byte(path).unwrap_or(false) {
+                    continue;
+                }
+                files.push(rel_str);
+            }
+        }
         files.sort();
         Ok(files)
     }
 
-    fn walk_dir(
+    /// Walk a subdirectory, returning paths relative to `prefix_root` (e.g. the repo root).
+    fn walk_dir_files_with_options(
         dir: &Path,
-        root: &Path,
+        prefix_root: &Path,
         registry: &ParserRegistry,
-        files: &mut Vec<String>,
-    ) -> Result<(), String> {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(e) => return Err(format!("Failed to read directory {}: {}", dir.display(), e)),
-        };
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;
+        no_default_excludes: bool,
+    ) -> Result<Vec<String>, String> {
+        let mut files = Vec::new();
+        let mut builder = ignore::WalkBuilder::new(dir);
+        builder
+            .hidden(true)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true);
+        let semignore = prefix_root.join(".semignore");
+        if semignore.exists() {
+            builder.add_ignore(semignore);
+        }
+        Self::prune_default_excluded_dirs(&mut builder, prefix_root, no_default_excludes);
+        let walker = builder.build();
+        for entry in walker.flatten() {
             let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with('.')
-                    || name == "node_modules"
-                    || name == "target"
-                    || name == "__pycache__"
-                    || name == "venv"
-                    || name == "vendor"
-                    || name == "dist"
-                    || name == "build"
+            if !path.is_file() {
+                continue;
+            }
+            if let Ok(rel) = path.strip_prefix(prefix_root) {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                if (!no_default_excludes && is_default_excluded(&rel_str))
+                    || is_probably_binary_path(&rel_str)
                 {
                     continue;
                 }
-            }
-            if path.is_dir() {
-                Self::walk_dir(&path, root, registry, files)?;
-            } else if let Ok(rel) = path.strip_prefix(root) {
-                let rel_str = rel.to_string_lossy().to_string();
-                if registry.get_plugin(&rel_str).is_some() {
-                    files.push(rel_str);
+                if registry.get_plugin(&rel_str).is_none() {
+                    continue;
                 }
+                if has_nul_byte(path).unwrap_or(false) {
+                    continue;
+                }
+                files.push(rel_str);
             }
         }
-        Ok(())
+        files.sort();
+        Ok(files)
+    }
+
+    fn prune_default_excluded_dirs(
+        builder: &mut ignore::WalkBuilder,
+        prefix_root: &Path,
+        no_default_excludes: bool,
+    ) {
+        if no_default_excludes {
+            return;
+        }
+
+        let prefix_root = prefix_root.to_path_buf();
+        builder.filter_entry(move |entry| {
+            if !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_dir())
+            {
+                return true;
+            }
+
+            let Ok(rel) = entry.path().strip_prefix(&prefix_root) else {
+                return true;
+            };
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            !is_default_excluded(&rel_str)
+        });
     }
 
     fn read_file_at(abs_path: &Path, display_path: &str) -> Result<String, String> {
@@ -178,17 +384,17 @@ impl SemServer {
         let mut entities = Vec::new();
         for rel_path in file_paths {
             let abs_path = root.join(rel_path);
-            let content = Self::read_file_at(&abs_path, rel_path)?;
+            let content = match std::fs::read_to_string(&abs_path) {
+                Ok(content) => content,
+                Err(err) if err.kind() == ErrorKind::InvalidData => continue,
+                Err(err) => return Err(format!("Failed to read {}: {}", rel_path, err)),
+            };
             entities.extend(self.cached_extract_entities(&content, rel_path).await);
         }
         Ok(entities)
     }
 
-    async fn cached_extract_entities(
-        &self,
-        content: &str,
-        rel_path: &str,
-    ) -> Vec<SemanticEntity> {
+    async fn cached_extract_entities(&self, content: &str, rel_path: &str) -> Vec<SemanticEntity> {
         let hash = content_hash_u64(content);
         let key = (rel_path.to_string(), hash);
 
@@ -213,37 +419,119 @@ impl SemServer {
         entities
     }
 
-    /// Find entity by name in graph, preferring match in the target file.
+    /// Find entity by name in the target file.
     fn find_entity_in_graph<'a>(
         graph: &'a EntityGraph,
         entity_name: &str,
         rel_path: &str,
-    ) -> Result<&'a str, rmcp::ErrorData> {
-        graph
+    ) -> Result<&'a str, String> {
+        // Match the bare name, or `Class.method` addressing (a child entity
+        // whose parent is named by the qualifier before the final dot). Agents
+        // reach for `Class.method` naturally.
+        let qualified = entity_name.rsplit_once('.');
+        let matches = |e: &sem_core::parser::graph::EntityInfo| {
+            e.name == entity_name
+                || qualified.is_some_and(|(parent_part, child_part)| {
+                    e.name == child_part
+                        && e.parent_id
+                            .as_ref()
+                            .and_then(|pid| graph.entities.get(pid))
+                            .is_some_and(|p| p.name == parent_part)
+                })
+        };
+
+        if let Some(entity) = graph
             .entities
             .values()
-            .find(|e| e.name == entity_name && e.file_path == rel_path)
-            .or_else(|| graph.entities.values().find(|e| e.name == entity_name))
-            .map(|e| e.id.as_str())
-            .ok_or_else(|| internal_err(format!("Entity '{}' not found in graph", entity_name)))
+            .find(|e| matches(e) && e.file_path == rel_path)
+        {
+            return Ok(entity.id.as_str());
+        }
+
+        let mut candidates: Vec<&str> = graph
+            .entities
+            .values()
+            .filter(|e| matches(e))
+            .map(|e| e.file_path.as_str())
+            .collect();
+        candidates.sort_unstable();
+        candidates.dedup();
+
+        if candidates.is_empty() {
+            Err(format!(
+                "Entity '{}' not found in '{}'",
+                entity_name, rel_path
+            ))
+        } else {
+            Err(format!(
+                "Entity '{}' not found in '{}' (existing candidates: {})",
+                entity_name,
+                rel_path,
+                format_entity_lookup_candidates(&candidates)
+            ))
+        }
     }
 
-    /// Extract all entities from all supported files in parallel.
-    fn extract_all_entities(
-        root: &Path,
-        file_paths: &[String],
-        registry: &ParserRegistry,
-    ) -> Vec<SemanticEntity> {
-        file_paths
-            .iter()
-            .filter_map(|fp| {
-                let full = root.join(fp);
-                let content = std::fs::read_to_string(&full).ok()?;
-                let plugin = registry.get_plugin(fp)?;
-                Some(plugin.extract_entities(&content, fp))
-            })
-            .flatten()
-            .collect()
+    /// Resolve an entity by name across the whole repo (one-call lookup, no
+    /// file hint). Unique match wins; ambiguity returns the candidate files so
+    /// the agent can disambiguate in its next call; no match returns near-name
+    /// suggestions.
+    fn find_entity_repo_wide<'a>(
+        graph: &'a EntityGraph,
+        entity_name: &str,
+    ) -> Result<&'a sem_core::parser::graph::EntityInfo, String> {
+        let qualified = entity_name.rsplit_once('.');
+        let matches = |e: &sem_core::parser::graph::EntityInfo| {
+            e.name == entity_name
+                || qualified.is_some_and(|(parent_part, child_part)| {
+                    e.name == child_part
+                        && e.parent_id
+                            .as_ref()
+                            .and_then(|pid| graph.entities.get(pid))
+                            .is_some_and(|p| p.name == parent_part)
+                })
+        };
+        let mut hits: Vec<&sem_core::parser::graph::EntityInfo> =
+            graph.entities.values().filter(|e| matches(e)).collect();
+        hits.sort_by(|a, b| (&a.file_path, a.start_line).cmp(&(&b.file_path, b.start_line)));
+        match hits.len() {
+            1 => Ok(hits[0]),
+            0 => {
+                let lower = entity_name.to_lowercase();
+                let mut near: Vec<&str> = graph
+                    .entities
+                    .values()
+                    .filter(|e| e.name.to_lowercase().contains(&lower))
+                    .map(|e| e.name.as_str())
+                    .collect();
+                near.sort_unstable();
+                near.dedup();
+                near.truncate(5);
+                if near.is_empty() {
+                    Err(format!("Entity '{}' not found in this repo", entity_name))
+                } else {
+                    Err(format!(
+                        "Entity '{}' not found. Near matches: {}",
+                        entity_name,
+                        near.join(", ")
+                    ))
+                }
+            }
+            _ => {
+                let files: Vec<String> = hits
+                    .iter()
+                    .map(|e| e.file_path.clone())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                Err(format!(
+                    "Entity '{}' is ambiguous ({} matches). Pass file_path to pick one: {}",
+                    entity_name,
+                    hits.len(),
+                    files.join(", ")
+                ))
+            }
+        }
     }
 
     /// Get cached graph or build a new one. Checks: memory cache -> SQLite cache -> fresh build.
@@ -251,6 +539,7 @@ impl SemServer {
         &self,
         repo_root: &Path,
         file_paths: &[String],
+        source_scope: cache::CacheSourceScope,
     ) -> (Arc<EntityGraph>, Arc<Vec<SemanticEntity>>) {
         let manifest_hash = cache::compute_manifest_hash(repo_root, file_paths).unwrap_or(0);
 
@@ -267,7 +556,9 @@ impl SemServer {
         // Check SQLite cache (full hit, then incremental)
         if let Ok(disk) = cache::DiskCache::open(repo_root) {
             // Full cache hit
-            if let Some((graph, entities)) = disk.load(repo_root, file_paths) {
+            if let Some((graph, entities)) =
+                disk.load_with_source_scope(repo_root, file_paths, source_scope)
+            {
                 let graph = Arc::new(graph);
                 let entities = Arc::new(entities);
                 let mut guard = self.graph_cache.lock().await;
@@ -276,26 +567,39 @@ impl SemServer {
                     graph: graph.clone(),
                     entities: entities.clone(),
                 });
+                let mut topology_guard = self.topology_cache.lock().await;
+                *topology_guard = Some(CachedTopology {
+                    manifest_hash,
+                    graph: graph.clone(),
+                });
                 return (graph, entities);
             }
 
             // Incremental: load clean cached data, rebuild only stale files
-            if let Some(partial) = disk.load_partial(repo_root, file_paths) {
-                let (graph, entities) = EntityGraph::build_incremental(
-                    repo_root,
-                    &partial.stale_files,
-                    file_paths,
-                    partial.cached_entities,
-                    partial.cached_edges,
-                    partial.stale_file_entities,
-                    &self.registry,
-                );
-                let _ = disk.save_incremental(
+            if let Some(partial) =
+                disk.load_partial_with_source_scope(repo_root, file_paths, source_scope)
+            {
+                let (graph, entities, metadata) =
+                    EntityGraph::build_incremental_with_metadata_and_import_candidates(
+                        repo_root,
+                        &partial.stale_files,
+                        file_paths,
+                        partial.cached_entities,
+                        partial.cached_edges,
+                        partial.stale_file_entities,
+                        Some(&partial.cached_importing_stale_files),
+                        &self.registry,
+                    );
+                let _ = disk.save_incremental_with_repair_metadata(
                     repo_root,
                     file_paths,
                     &partial.stale_files,
                     &graph,
                     &entities,
+                    metadata.repaired_clean_entity_ids,
+                    &metadata.recomputed_edge_source_ids,
+                    &metadata.deleted_entity_ids,
+                    source_scope,
                 );
 
                 let graph = Arc::new(graph);
@@ -305,6 +609,11 @@ impl SemServer {
                     manifest_hash,
                     graph: graph.clone(),
                     entities: entities.clone(),
+                });
+                let mut topology_guard = self.topology_cache.lock().await;
+                *topology_guard = Some(CachedTopology {
+                    manifest_hash,
+                    graph: graph.clone(),
                 });
                 return (graph, entities);
             }
@@ -315,7 +624,7 @@ impl SemServer {
 
         // Persist to SQLite (best-effort)
         if let Ok(disk) = cache::DiskCache::open(repo_root) {
-            let _ = disk.save(repo_root, file_paths, &graph, &entities);
+            let _ = disk.save(repo_root, file_paths, &graph, &entities, source_scope);
         }
 
         let graph = Arc::new(graph);
@@ -330,8 +639,493 @@ impl SemServer {
                 entities: entities.clone(),
             });
         }
+        {
+            let mut guard = self.topology_cache.lock().await;
+            *guard = Some(CachedTopology {
+                manifest_hash,
+                graph: graph.clone(),
+            });
+        }
 
         (graph, entities)
+    }
+
+    async fn get_or_build_graph_topology(
+        &self,
+        repo_root: &Path,
+        file_paths: &[String],
+        source_scope: cache::CacheSourceScope,
+    ) -> Arc<EntityGraph> {
+        let manifest_hash = cache::compute_manifest_hash(repo_root, file_paths).unwrap_or(0);
+
+        {
+            let guard = self.graph_cache.lock().await;
+            if let Some(ref cached) = *guard {
+                if cached.manifest_hash == manifest_hash {
+                    return cached.graph.clone();
+                }
+            }
+        }
+
+        {
+            let guard = self.topology_cache.lock().await;
+            if let Some(ref cached) = *guard {
+                if cached.manifest_hash == manifest_hash {
+                    return cached.graph.clone();
+                }
+            }
+        }
+
+        if let Ok(disk) = cache::DiskCache::open(repo_root) {
+            if let Some(graph) =
+                disk.load_graph_topology_with_source_scope(repo_root, file_paths, source_scope)
+            {
+                let graph = Arc::new(graph);
+                let mut guard = self.topology_cache.lock().await;
+                *guard = Some(CachedTopology {
+                    manifest_hash,
+                    graph: graph.clone(),
+                });
+                return graph;
+            }
+        }
+
+        let (graph, _) = self
+            .get_or_build_graph(repo_root, file_paths, source_scope)
+            .await;
+        graph
+    }
+
+    fn cache_source_scope(repo_root: &Path, no_default_excludes: bool) -> cache::CacheSourceScope {
+        if no_default_excludes || repo_root.join(".semignore").exists() {
+            cache::CacheSourceScope::Custom
+        } else {
+            cache::CacheSourceScope::Default
+        }
+    }
+
+    /// Ensure the in-memory whole-repo caches are fresh with respect to the file
+    /// watcher, returning the current source file list. On the fast path
+    /// (nothing changed since the last build) this avoids re-walking and
+    /// re-stat-ing the tree entirely. Returns `None` when watching is disabled
+    /// or unavailable, in which case the caller uses the stat-based path.
+    async fn ensure_live(&self, repo_root: &Path) -> Option<Vec<String>> {
+        if !watch_enabled() {
+            return None;
+        }
+
+        let mut slot = self.watch.lock().await;
+
+        // Lazily start the watcher for this repo on first use.
+        if slot.watcher.is_none() {
+            if !slot.enabled {
+                return None;
+            }
+            match RepoWatcher::start(repo_root) {
+                Ok(w) => slot.watcher = Some(w),
+                Err(_) => {
+                    slot.enabled = false;
+                    return None;
+                }
+            }
+        }
+
+        let drained = slot.watcher.as_ref().unwrap().drain();
+
+        // Fast path: nothing has changed since the last build, so the cached
+        // graph is still valid. No walk, no stat storm.
+        let clean = slot.built_once
+            && drained.generation == slot.last_built_generation
+            && !slot.file_paths.is_empty();
+        if clean {
+            return Some(slot.file_paths.clone());
+        }
+
+        // Something changed (or first build). Refresh the file list only when
+        // the set of files may have changed; content-only edits reuse it.
+        if slot.file_paths.is_empty() || drained.needs_rewalk {
+            match Self::find_supported_files(repo_root, &self.registry) {
+                Ok(files) => slot.file_paths = files,
+                Err(_) => return None,
+            }
+        }
+        let file_paths = slot.file_paths.clone();
+
+        // Rebuild (incrementally, via the disk cache) and repopulate the memory
+        // caches that live_graph / live_topology read from.
+        let source_scope = Self::cache_source_scope(repo_root, false);
+        let _ = self
+            .get_or_build_graph(repo_root, &file_paths, source_scope)
+            .await;
+        slot.last_built_generation = drained.generation;
+        slot.built_once = true;
+        Some(file_paths)
+    }
+
+    /// One-call entity context from the in-memory graph, for the socket
+    /// sidecar: resolve `name` repo-wide, pack a bounded context, render the
+    /// compact text. Millisecond-fast once the graph is warm.
+    /// Attention-ledger check shared by the sidecar/CLI and MCP context paths.
+    /// Returns Some(reply) when this session already holds the fill: either a
+    /// one-line "unchanged" answer, or an entity-level delta against the
+    /// version the session saw. None means send the full fill (recorded here).
+    async fn ledger_reply(
+        &self,
+        session: &str,
+        entity_id: &str,
+        name: &str,
+        file_path: &str,
+        target_content: &str,
+        packed_marker: &str,
+        fresh_hint: &str,
+    ) -> Option<String> {
+        const MAX_STORED_CONTENT: usize = 64 * 1024;
+        const MAX_DELTA_LINES: usize = 120;
+
+        let fingerprint = format!("{:016x}:{packed_marker}", fnv1a_hash(target_content));
+        let key = format!("{session}\u{0}{entity_id}");
+        let mut ledger = self.fill_ledger.lock().await;
+        let prev = ledger.get(&key).cloned();
+        let record = LedgerFill {
+            fingerprint: fingerprint.clone(),
+            content: if target_content.len() <= MAX_STORED_CONTENT {
+                target_content.to_string()
+            } else {
+                String::new()
+            },
+        };
+        match prev {
+            Some(prev) if prev.fingerprint == fingerprint => Some(format!(
+                "≡ {name} · unchanged since you read it ({file_path}) — already in your context; {fresh_hint}\n"
+            )),
+            Some(prev) if !prev.content.is_empty() && prev.content != target_content => {
+                // Entity changed: answer with the delta against what the
+                // session saw. Fall back to a full fill when the delta is
+                // bigger than the body would be.
+                let diff = similar::TextDiff::from_lines(prev.content.as_str(), target_content);
+                let mut lines = Vec::new();
+                for change in diff.iter_all_changes() {
+                    match change.tag() {
+                        similar::ChangeTag::Delete => lines.push(format!("- {change}")),
+                        similar::ChangeTag::Insert => lines.push(format!("+ {change}")),
+                        similar::ChangeTag::Equal => {}
+                    }
+                }
+                ledger.put(key, record);
+                if lines.is_empty() || lines.len() > MAX_DELTA_LINES {
+                    return None;
+                }
+                let mut out = format!(
+                    "∆ {name} · changed since you read it ({file_path}) — delta vs the version in your context ({} lines):\n",
+                    lines.len()
+                );
+                for l in &lines {
+                    out.push_str(l);
+                    if !l.ends_with('\n') {
+                        out.push('\n');
+                    }
+                }
+                out.push_str(&format!("(callers/callees not re-packed; {fresh_hint})\n"));
+                Some(out)
+            }
+            _ => {
+                ledger.put(key, record);
+                None
+            }
+        }
+    }
+
+    /// Sidecar fast path: entity-addressed text search from the warm graph.
+    pub async fn quick_text(
+        &self,
+        repo_root: &Path,
+        needle: &str,
+        limit: usize,
+    ) -> Result<String, String> {
+        let (_, all_entities) = self.live_graph(repo_root).await;
+        Ok(Self::render_text_hits(&all_entities, needle, limit))
+    }
+
+    pub async fn quick_context(
+        &self,
+        repo_root: &Path,
+        name: &str,
+        budget: usize,
+        hops: usize,
+        session: Option<&str>,
+    ) -> Result<String, String> {
+        let (graph, all_entities) = self.live_graph(repo_root).await;
+        let entity = Self::find_entity_repo_wide(&graph, name)?;
+        let context_result = sem_core::parser::context::build_context_result_bounded(
+            &graph,
+            &entity.id,
+            &all_entities,
+            budget,
+            hops,
+        );
+
+        // Attention ledger: repeats answer as one line, changed entities as a
+        // delta against the version the session saw (delta-fills).
+        if let Some(session) = session.filter(|s| !s.is_empty()) {
+            let target_content = all_entities
+                .iter()
+                .find(|e| e.id == entity.id)
+                .map(|e| e.content.as_str())
+                .unwrap_or("");
+            let packed_marker = format!(
+                "{}:{}",
+                context_result.total_tokens,
+                context_result.entries.len()
+            );
+            if let Some(reply) = self
+                .ledger_reply(
+                    session,
+                    &entity.id,
+                    name,
+                    &entity.file_path,
+                    target_content,
+                    &packed_marker,
+                    "set SEM_FRESH=1 for the full re-pack",
+                )
+                .await
+            {
+                return Ok(reply);
+            }
+        }
+        let result: Vec<serde_json::Value> = context_result
+            .entries
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "entity": e.entity_name,
+                    "type": e.entity_type,
+                    "file": e.file_path,
+                    "role": e.role,
+                    "tokens": e.estimated_tokens,
+                    "content": e.content,
+                })
+            })
+            .collect();
+        Ok(crate::render::context_text(&serde_json::json!({
+            "entity": name,
+            "file": entity.file_path,
+            "token_budget": budget,
+            "tokens_used": context_result.total_tokens,
+            "truncated": context_result.truncated,
+            "target_omitted": context_result.target_omitted,
+            "entries": result.len(),
+            "context": result,
+            "omitted": omitted_tails_json(&context_result),
+            "source": "local",
+        })))
+    }
+
+    /// One-call impact for sidecar clients (the CLI fast path): resolve the
+    /// entity by name — file-scoped when a hint is given, repo-wide otherwise —
+    /// then dependencies, dependents, depth-bounded transitive impact (0 =
+    /// unlimited), and affected tests, all from the live in-memory graph.
+    /// Returns typed JSON (serialized `EntityInfo`s) that the CLI deserializes
+    /// straight into its own printer structs, so fast-path output is identical
+    /// to the local compute path. Errors (unknown/ambiguous entity) make the
+    /// caller fall back to local resolution and its richer diagnostics.
+    pub async fn quick_impact(
+        &self,
+        repo_root: &Path,
+        name: &str,
+        file_hint: Option<&str>,
+        max_depth: usize,
+    ) -> Result<serde_json::Value, String> {
+        let (graph, all_entities) = self.live_graph(repo_root).await;
+        let entity = match file_hint {
+            Some(rel_path) => {
+                let entity_id = Self::find_entity_in_graph(&graph, name, rel_path)?;
+                graph
+                    .entities
+                    .get(entity_id)
+                    .ok_or_else(|| format!("Entity '{name}' not found"))?
+            }
+            None => Self::find_entity_repo_wide(&graph, name)?,
+        };
+
+        let dependencies: Vec<_> = graph
+            .get_dependencies(&entity.id)
+            .into_iter()
+            .cloned()
+            .collect();
+        let dependents: Vec<_> = graph
+            .get_dependents(&entity.id)
+            .into_iter()
+            .cloned()
+            .collect();
+
+        // One unbounded BFS over reverse edges (capped like impact_analysis),
+        // recording each entity at its minimum depth. The depth-bounded impact
+        // list and the affected-tests list are both views of this reach set —
+        // classifying only reached entities as tests instead of walking the
+        // whole corpus (`test_impact_with_custom_dirs` clones every test id in
+        // the repo per call, which at sidecar rates was the entire latency
+        // budget: 6.8ms → 0.1ms measured on a 4.7K-entity graph).
+        const BFS_CAP: usize = 10_000;
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut reached: Vec<(&sem_core::parser::graph::EntityInfo, usize)> = Vec::new();
+        let mut queue: std::collections::VecDeque<(&str, usize)> =
+            std::collections::VecDeque::new();
+        seen.insert(entity.id.as_str());
+        queue.push_back((entity.id.as_str(), 0));
+        while let Some((id, depth)) = queue.pop_front() {
+            if reached.len() >= BFS_CAP {
+                break;
+            }
+            for dependent in graph.get_dependents(id) {
+                if seen.insert(dependent.id.as_str()) {
+                    reached.push((dependent, depth + 1));
+                    queue.push_back((dependent.id.as_str(), depth + 1));
+                }
+            }
+        }
+
+        let impact: Vec<(sem_core::parser::graph::EntityInfo, usize)> = reached
+            .iter()
+            .filter(|(_, depth)| max_depth == 0 || *depth <= max_depth)
+            .map(|(info, depth)| ((*info).clone(), *depth))
+            .collect();
+
+        let by_id: std::collections::HashMap<&str, &SemanticEntity> =
+            all_entities.iter().map(|e| (e.id.as_str(), e)).collect();
+        let tests: Vec<sem_core::parser::graph::EntityInfo> = reached
+            .iter()
+            .filter(|(info, _)| {
+                by_id.get(info.id.as_str()).is_some_and(|e| {
+                    sem_core::parser::graph::is_test_entity(e, &self.registry.custom_test_dirs)
+                })
+            })
+            .map(|(info, _)| (*info).clone())
+            .collect();
+
+        Ok(serde_json::json!({
+            "entity": entity,
+            "dependencies": dependencies,
+            "dependents": dependents,
+            "impact": impact,
+            "tests": tests,
+        }))
+    }
+
+    /// Entity-addressed text search over in-memory entity bodies. For each
+    /// matching line, the innermost (smallest-span) enclosing entity wins, so
+    /// a hit inside a method reports the method, not its class.
+    pub fn render_text_hits(all_entities: &[SemanticEntity], needle: &str, limit: usize) -> String {
+        use std::collections::HashMap;
+        // (file, absolute line) -> (span, entity name, entity type, line text)
+        let mut best: HashMap<(&str, usize), (usize, &str, &str, &str)> = HashMap::new();
+        for e in all_entities {
+            if !e.content.contains(needle) {
+                continue;
+            }
+            let span = e.end_line.saturating_sub(e.start_line);
+            for (offset, line) in e.content.lines().enumerate() {
+                if !line.contains(needle) {
+                    continue;
+                }
+                let abs_line = e.start_line + offset;
+                let key = (e.file_path.as_str(), abs_line);
+                match best.get(&key) {
+                    Some((s, ..)) if *s <= span => {}
+                    _ => {
+                        best.insert(key, (span, e.name.as_str(), e.entity_type.as_str(), line));
+                    }
+                }
+            }
+        }
+        if best.is_empty() {
+            return format!(
+                "no entity contains \"{needle}\" (searches code entity bodies; \
+                 comments between entities and non-code files are not covered)"
+            );
+        }
+        let mut hits: Vec<((&str, usize), (usize, &str, &str, &str))> = best.into_iter().collect();
+        hits.sort_by(|a, b| (a.0 .0, a.0 .1).cmp(&(b.0 .0, b.0 .1)));
+        let total = hits.len();
+        let files: std::collections::BTreeSet<&str> = hits.iter().map(|(k, _)| k.0).collect();
+        let mut out = format!(
+            "⊕ text \"{needle}\" · {total} hits · {} files\n",
+            files.len()
+        );
+        for (i, ((file, line), (_, name, ty, text))) in hits.iter().take(limit).enumerate() {
+            let branch = if i + 1 == total.min(limit) {
+                "╰─▶"
+            } else {
+                "├─▶"
+            };
+            let label = if *ty == "function" || *ty == "method" {
+                (*name).to_string()
+            } else {
+                format!("{name} ({ty})")
+            };
+            let text = text.trim();
+            let text: String = text.chars().take(90).collect();
+            out.push_str(&format!("{branch} {file}: {label} (L{line}): {text}\n"));
+        }
+        if total > limit {
+            out.push_str(&format!("… {} more (raise limit)\n", total - limit));
+        }
+        out
+    }
+
+    /// Optionally kick a background graph build so the first whole-graph query
+    /// hits a warm in-memory graph. Opt-in (SEM_PREWARM): proactively holding the
+    /// entire deserialized graph costs GBs on large repos (~5GB on the Linux
+    /// kernel) and is now mostly wasted, since `context` and `impact` answer from
+    /// the indexed cache directly and the CLI's fast paths bypass the resident
+    /// entirely. By default the resident stays light and builds the full graph
+    /// lazily, only when a query that genuinely needs it (graph/diff/text) runs.
+    pub fn spawn_prewarm(&self) {
+        if std::env::var_os("SEM_PREWARM").is_none() {
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            let Ok(repo_root) = Self::discover_repo_root(None) else {
+                return;
+            };
+            let _ = this.live_graph(&repo_root).await;
+        });
+    }
+
+    /// Whole-repo (graph, entities), kept hot by the file watcher when active.
+    async fn live_graph(&self, repo_root: &Path) -> (Arc<EntityGraph>, Arc<Vec<SemanticEntity>>) {
+        if self.ensure_live(repo_root).await.is_some() {
+            let guard = self.graph_cache.lock().await;
+            if let Some(ref cached) = *guard {
+                return (cached.graph.clone(), cached.entities.clone());
+            }
+        }
+        let file_paths = Self::find_supported_files(repo_root, &self.registry).unwrap_or_default();
+        let source_scope = Self::cache_source_scope(repo_root, false);
+        self.get_or_build_graph(repo_root, &file_paths, source_scope)
+            .await
+    }
+
+    /// Whole-repo graph topology, kept hot by the file watcher when active.
+    async fn live_topology(&self, repo_root: &Path) -> Arc<EntityGraph> {
+        if self.ensure_live(repo_root).await.is_some() {
+            {
+                let guard = self.graph_cache.lock().await;
+                if let Some(ref cached) = *guard {
+                    return cached.graph.clone();
+                }
+            }
+            {
+                let guard = self.topology_cache.lock().await;
+                if let Some(ref cached) = *guard {
+                    return cached.graph.clone();
+                }
+            }
+        }
+        let file_paths = Self::find_supported_files(repo_root, &self.registry).unwrap_or_default();
+        let source_scope = Self::cache_source_scope(repo_root, false);
+        self.get_or_build_graph_topology(repo_root, &file_paths, source_scope)
+            .await
     }
 }
 
@@ -345,196 +1139,252 @@ impl SemServer {
                 std::num::NonZeroUsize::new(500).unwrap(),
             ))),
             graph_cache: Arc::new(Mutex::new(None)),
-            tool_router: Self::tool_router(),
+            topology_cache: Arc::new(Mutex::new(None)),
+            watch: Arc::new(Mutex::new(WatchSlot::default())),
+            fill_ledger: Arc::new(Mutex::new(LruCache::new(
+                std::num::NonZeroUsize::new(10_000).unwrap(),
+            ))),
+            _tool_router: Self::tool_router(),
         }
     }
 
     // ── Tool 1: Entities ──
 
-    #[tool(description = "List semantic entities (functions, classes, etc.) under a file or directory path. Defaults to '.'.")]
+    #[tool(
+        description = "List semantic entities (functions, classes, etc.) under a file or directory path (defaults to '.'). Pass `text` to search entity bodies for an exact substring instead (entity-addressed, grep-style hits ready for sem_context/sem_impact)."
+    )]
     async fn sem_entities(
         &self,
         Parameters(params): Parameters<EntitiesParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let path = params.path().unwrap_or(".");
-        let ctx = self
-            .get_context(Some(path))
-            .await
-            .map_err(internal_err)?;
+        let ctx = match self.get_context(Some(path)).await {
+            Ok(ctx) => ctx,
+            Err(err) => return Ok(tool_error(err)),
+        };
+
+        // Text mode: entity-addressed grep. Scan entity bodies in the warm
+        // in-memory graph — no file reads — and return hits addressed by the
+        // innermost enclosing entity, ready for sem_context / sem_impact
+        // chaining. This is the grep killer: same latency class, but hits are
+        // entities, not line numbers in anonymous files.
+        if let Some(needle) = params.text() {
+            let (_, all_entities) = self.live_graph(&ctx.repo_root).await;
+            let text = Self::render_text_hits(&all_entities, needle, params.limit());
+            return Ok(CallToolResult::success(vec![Content::text(text)]));
+        }
 
         let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, path);
         let (entities, include_file) = if abs_path.is_file() {
-            let content = Self::read_file_at(&abs_path, &rel_path).map_err(internal_err)?;
+            if !params.no_default_excludes() && is_default_excluded(&rel_path) {
+                return Ok(tool_error(format!(
+                    "Path is excluded by default: {}",
+                    rel_path
+                )));
+            }
+            let content = match Self::read_file_at(&abs_path, &rel_path) {
+                Ok(content) => content,
+                Err(err) => return Ok(tool_error(err)),
+            };
 
             let entities = self.cached_extract_entities(&content, &rel_path).await;
             if entities.is_empty() {
                 if self.registry.get_plugin(&rel_path).is_none() {
-                    return Err(internal_err(format!("No parser for file: {}", rel_path)));
+                    return Ok(tool_error(format!("No parser for file: {}", rel_path)));
                 }
             }
             (entities, false)
         } else if abs_path.is_dir() {
-            let mut file_paths = Vec::new();
-            Self::walk_dir(&abs_path, &ctx.repo_root, &self.registry, &mut file_paths)
-                .map_err(internal_err)?;
-            file_paths.sort();
+            // Cloud-first for whole-repo listings of large registered repos;
+            // single files / subdirs and custom-scope listings stay local.
+            if !params.no_default_excludes() {
+                if let Some(out) = crate::cloud::try_entities(&ctx.git, &ctx.repo_root, &abs_path) {
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        serde_json::to_string_pretty(&out).unwrap_or_default(),
+                    )]));
+                }
+            }
+            let file_paths = match Self::walk_dir_files_with_options(
+                &abs_path,
+                &ctx.repo_root,
+                &self.registry,
+                params.no_default_excludes(),
+            ) {
+                Ok(file_paths) => file_paths,
+                Err(err) => return Ok(tool_error(err)),
+            };
 
-            let all_entities = self
+            let all_entities = match self
                 .extract_entities_from_files(&ctx.repo_root, &file_paths)
                 .await
-                .map_err(internal_err)?;
+            {
+                Ok(entities) => entities,
+                Err(err) => return Ok(tool_error(err)),
+            };
             (all_entities, true)
         } else {
-            return Err(internal_err(format!("Path not found: {}", path)));
+            return Ok(tool_error(format!("Path not found: {}", path)));
         };
 
-        let result: Vec<serde_json::Value> = entities
-            .iter()
-            .map(|e| {
-                let mut value = serde_json::json!({
-                    "id": e.id,
-                    "name": e.name,
-                    "type": e.entity_type,
-                    "start_line": e.start_line,
-                    "end_line": e.end_line,
-                    "parent_id": e.parent_id,
-                });
-                if include_file {
-                    value["file"] = serde_json::json!(e.file_path);
+        // Compact per-line tree instead of JSON: name · type · lines, children
+        // indented under their parent, files as group headers for directory
+        // listings. Same information, ~6x fewer tokens for the reading model.
+        let entity_line = |e: &sem_core::model::entity::SemanticEntity| {
+            let indent = if e.parent_id.is_some() { "  " } else { "" };
+            let lines = if e.end_line > e.start_line {
+                format!("L{}-{}", e.start_line, e.end_line)
+            } else {
+                format!("L{}", e.start_line)
+            };
+            format!("{}{} · {} · {}\n", indent, e.name, e.entity_type, lines)
+        };
+        let mut out = format!("⊕ {} entities · {}\n", entities.len(), rel_path);
+        if include_file {
+            let mut current_file = "";
+            for e in &entities {
+                if e.file_path != current_file {
+                    current_file = &e.file_path;
+                    out.push_str(&format!("\n{}\n", current_file));
                 }
-                value
-            })
-            .collect();
+                out.push_str(&entity_line(e));
+            }
+        } else {
+            for e in &entities {
+                out.push_str(&entity_line(e));
+            }
+        }
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&result).unwrap_or_default(),
-        )]))
+        Ok(CallToolResult::success(vec![Content::text(out)]))
     }
 
     // ── Tool 2: Diff ──
 
-    #[tool(description = "Semantic diff between two refs: shows entity-level changes (added, modified, deleted, renamed) instead of line-level diffs")]
+    #[tool(
+        description = "Semantic diff between two refs: shows entity-level changes (added, modified, deleted, renamed) instead of line-level diffs"
+    )]
     async fn sem_diff(
         &self,
         Parameters(params): Parameters<DiffParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let ctx = self
-            .get_context(params.file_path.as_deref())
-            .await
-            .map_err(internal_err)?;
+        let ctx = match self.get_context(params.file_path.as_deref()).await {
+            Ok(ctx) => ctx,
+            Err(err) => return Ok(tool_error(err)),
+        };
 
-        let target_ref = params.target_ref.as_deref().unwrap_or("HEAD");
-
-        let scope = DiffScope::Range {
-            from: params.base_ref.clone(),
-            to: target_ref.to_string(),
+        let scope = if let Some(ref base) = params.base_ref {
+            let target_ref = params.target_ref.as_deref().unwrap_or("HEAD");
+            DiffScope::Range {
+                from: base.clone(),
+                to: target_ref.to_string(),
+            }
+        } else {
+            // Default: working-tree changes, same as CLI `sem diff` (#154)
+            DiffScope::Working
         };
 
         let pathspecs: Vec<String> = if let Some(ref fp) = params.file_path {
-            let (rel, _) = Self::resolve_file_path(&ctx.repo_root, fp);
+            let (rel, abs_path) = Self::resolve_file_path(&ctx.repo_root, fp);
+            if let Some(err) = pathspec_error(&ctx.git, &scope, &rel, fp, &abs_path) {
+                return Ok(tool_error(err));
+            }
             vec![rel]
         } else {
             vec![]
         };
 
-        let file_changes = ctx
-            .git
-            .get_changed_files(&scope, &pathspecs)
-            .map_err(|e| internal_err(e.to_string()))?;
+        let file_changes = match ctx.git.get_changed_files(&scope, &pathspecs) {
+            Ok(file_changes) => file_changes,
+            Err(err) => return Ok(tool_error(err.to_string())),
+        };
 
-        let diff_result =
-            compute_semantic_diff(&file_changes, &self.registry, None, None);
-
-        let changes: Vec<serde_json::Value> = diff_result
-            .changes
-            .iter()
-            .map(|c| {
-                let mut obj = serde_json::json!({
-                    "file": c.file_path,
-                    "entity_name": c.entity_name,
-                    "entity_type": c.entity_type,
-                    "change_type": c.change_type.to_string(),
-                });
-                if let Some(ref old_name) = c.old_entity_name {
-                    obj["old_entity_name"] = serde_json::json!(old_name);
-                }
-                if let Some(ref old_path) = c.old_file_path {
-                    obj["old_file_path"] = serde_json::json!(old_path);
-                }
-                obj
-            })
-            .collect();
+        let binary_changes = collect_binary_file_changes(&file_changes);
+        let diff_result = compute_semantic_diff(&file_changes, &self.registry, None, None);
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&serde_json::json!({
-                "base_ref": params.base_ref,
-                "target_ref": target_ref,
-                "files_analyzed": diff_result.file_count,
-                "total_changes": changes.len(),
-                "changes": changes,
-            }))
-            .unwrap_or_default(),
+            format_diff_json_with_binary_changes(&diff_result, &binary_changes),
         )]))
     }
 
     // ── Tool 3: Blame ──
 
-    #[tool(description = "Entity-level git blame: for each entity in a file, shows who last modified it, when, and why")]
+    #[tool(
+        description = "Entity-level git blame: for each entity in a file, shows who last modified it, when, and why"
+    )]
     async fn sem_blame(
         &self,
         Parameters(params): Parameters<BlameParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let ctx = self
-            .get_context(Some(&params.file_path))
-            .await
-            .map_err(internal_err)?;
+        let ctx = match self.get_context(Some(&params.file_path)).await {
+            Ok(ctx) => ctx,
+            Err(err) => return Ok(tool_error(err)),
+        };
         let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, &params.file_path);
-        let content = Self::read_file_at(&abs_path, &rel_path).map_err(internal_err)?;
+        let content = match Self::read_file_at(&abs_path, &rel_path) {
+            Ok(content) => content,
+            Err(err) => return Ok(tool_error(err)),
+        };
 
         let entities = self.cached_extract_entities(&content, &rel_path).await;
         if entities.is_empty() {
             if self.registry.get_plugin(&rel_path).is_none() {
-                return Err(internal_err(format!("No parser for file: {}", rel_path)));
+                return Ok(tool_error(format!("No parser for file: {}", rel_path)));
             }
         }
 
-        let blame = ctx
-            .git
-            .blame_file(Path::new(&rel_path))
-            .map_err(|e| internal_err(format!("Cannot blame {}: {}", rel_path, e)))?;
+        let blame = match ctx.git.blame_file_porcelain(Path::new(&rel_path)) {
+            Ok(blame) => blame,
+            Err(err) => return Ok(tool_error(format!("Cannot blame {}: {}", rel_path, err))),
+        };
+        let blame_by_line: HashMap<usize, BlameLineInfo> = blame
+            .into_iter()
+            .map(|line| (line.line_number, line))
+            .collect();
 
         let mut results: Vec<serde_json::Value> = Vec::new();
 
         for entity in &entities {
-            let mut latest_time: i64 = 0;
-            let mut latest_author = String::new();
-            let mut latest_sha = String::new();
-            let mut latest_summary = String::new();
-            let mut latest_date = String::new();
+            let mut selected: Option<&BlameLineInfo> = None;
 
             for line in entity.start_line..=entity.end_line {
-                if let Some(hunk) = blame.get_line(line) {
-                    let sig = hunk.final_signature();
-                    let time = sig.when().seconds();
-                    if time > latest_time {
-                        latest_time = time;
-                        latest_author = sig.name().unwrap_or("unknown").to_string();
-                        let oid = hunk.final_commit_id();
-                        latest_sha = format!("{}", oid);
-                        latest_summary = ctx.git.commit_summary(oid).unwrap_or_default();
-                        latest_date = chrono_lite_format(sig.when().seconds());
+                if let Some(info) = blame_by_line.get(&line) {
+                    if info.commit_sha.is_none() {
+                        selected = Some(info);
+                        break;
+                    }
+
+                    let is_newer = match (info.author_time, selected.and_then(|s| s.author_time)) {
+                        (Some(current), Some(previous)) => current > previous,
+                        (Some(_), None) => true,
+                        _ => selected.is_none(),
+                    };
+                    if is_newer {
+                        selected = Some(info);
                     }
                 }
             }
+
+            let (author, date, commit_sha, summary) = match selected {
+                Some(info) => (
+                    if info.author.is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        info.author.clone()
+                    },
+                    info.author_time.map(chrono_lite_format).unwrap_or_default(),
+                    info.commit_sha.clone(),
+                    info.summary.clone(),
+                ),
+                None => (String::from("unknown"), String::new(), None, String::new()),
+            };
 
             results.push(serde_json::json!({
                 "name": entity.name,
                 "type": entity.entity_type,
                 "lines": [entity.start_line, entity.end_line],
-                "author": latest_author,
-                "date": latest_date,
-                "commit": &latest_sha[..8.min(latest_sha.len())],
-                "summary": latest_summary,
+                "author": author,
+                "date": date,
+                "commit": commit_sha,
+                "summary": summary,
             }));
         }
 
@@ -550,66 +1400,158 @@ impl SemServer {
 
     // ── Tool 4: Impact ──
 
-    #[tool(description = "Unified entity analysis: dependencies, dependents, transitive impact, and affected tests. Use 'mode' to narrow: 'all' (default), 'deps', 'dependents', 'tests'.")]
+    #[tool(
+        description = "Unified entity analysis: dependencies, dependents, transitive impact, and affected tests. Use 'mode' to narrow: 'all' (default), 'deps', 'dependents', 'tests'."
+    )]
     async fn sem_impact(
         &self,
         Parameters(params): Parameters<ImpactAnalysisParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let ctx = self
-            .get_context(Some(&params.file_path))
-            .await
-            .map_err(internal_err)?;
-        let (rel_path, _) = Self::resolve_file_path(&ctx.repo_root, &params.file_path);
-
-        let file_paths =
-            Self::find_supported_files(&ctx.repo_root, &self.registry).map_err(internal_err)?;
-        let (graph, all_entities) = self.get_or_build_graph(&ctx.repo_root, &file_paths).await;
-
-        let entity_id = Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path)?;
+        let start = Instant::now();
+        let ctx = match self.get_context(Some(&params.file_path)).await {
+            Ok(ctx) => ctx,
+            Err(err) => return Ok(tool_error(err)),
+        };
+        let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, &params.file_path);
+        if let Some(err) = file_path_error(&params.file_path, &abs_path) {
+            return Ok(tool_error(err));
+        }
+        if self.registry.get_plugin(&rel_path).is_none() {
+            return Ok(tool_error(format!("No parser for file: {}", rel_path)));
+        }
+        let no_default_excludes = params.no_default_excludes.unwrap_or(false);
 
         let mode = params.mode.as_deref().unwrap_or("all");
+        let valid_modes = ["all", "deps", "dependents", "tests"];
+        if !valid_modes.contains(&mode) {
+            return Ok(tool_error(format!(
+                "Invalid mode '{}'. Valid modes: {}",
+                mode,
+                valid_modes.join(", ")
+            )));
+        }
 
-        let output = match mode {
-            "deps" => {
-                let deps = graph.get_dependencies(entity_id);
-                let result: Vec<serde_json::Value> = deps
-                    .iter()
-                    .map(|d| serde_json::json!({
-                        "name": d.name, "type": d.entity_type,
-                        "file": d.file_path, "lines": [d.start_line, d.end_line],
-                    }))
-                    .collect();
-                serde_json::json!({
-                    "entity": params.entity_name,
-                    "file": rel_path,
-                    "mode": "deps",
-                    "dependencies": result,
-                })
+        // Cloud-first: a logged-in agent on a large, registered repo gets the
+        // warm cloud graph instead of a local build. Custom-scope requests
+        // (no_default_excludes) stay local since the cloud indexes the default
+        // scope; on any miss/error this returns None and the local path runs.
+        if !no_default_excludes && std::env::var("SEM_MCP_CLOUD").is_ok_and(|v| v == "1") {
+            if let Some(mut out) =
+                crate::cloud::try_impact(&ctx.git, &params.entity_name, &rel_path, mode)
+            {
+                out["elapsed_ms"] = serde_json::json!(start.elapsed().as_millis() as u64);
+                out["source"] = serde_json::json!("cloud");
+                return Ok(CallToolResult::success(vec![Content::text(
+                    crate::render::impact_text(&out),
+                )]));
             }
-            "dependents" => {
-                let deps = graph.get_dependents(entity_id);
-                let result: Vec<serde_json::Value> = deps
-                    .iter()
-                    .map(|d| serde_json::json!({
-                        "name": d.name, "type": d.entity_type,
-                        "file": d.file_path, "lines": [d.start_line, d.end_line],
-                    }))
-                    .collect();
-                serde_json::json!({
-                    "entity": params.entity_name,
-                    "file": rel_path,
-                    "mode": "dependents",
-                    "dependents": result,
-                })
-            }
+        }
+
+        if matches!(mode, "deps" | "dependents") {
+            let graph = if no_default_excludes {
+                let file_paths = match Self::find_supported_files_with_options(
+                    &ctx.repo_root,
+                    &self.registry,
+                    no_default_excludes,
+                ) {
+                    Ok(file_paths) => file_paths,
+                    Err(err) => return Ok(tool_error(err)),
+                };
+                let source_scope = Self::cache_source_scope(&ctx.repo_root, no_default_excludes);
+                self.get_or_build_graph_topology(&ctx.repo_root, &file_paths, source_scope)
+                    .await
+            } else {
+                self.live_topology(&ctx.repo_root).await
+            };
+            let entity_id = match Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path)
+            {
+                Ok(entity_id) => entity_id,
+                Err(err) => return Ok(tool_error(err)),
+            };
+
+            let mut output = match mode {
+                "deps" => {
+                    let deps = graph.get_dependencies(entity_id);
+                    let result: Vec<serde_json::Value> = deps
+                        .iter()
+                        .map(|d| {
+                            serde_json::json!({
+                                "name": d.name, "type": d.entity_type,
+                                "file": d.file_path, "lines": [d.start_line, d.end_line],
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "entity": params.entity_name,
+                        "file": rel_path,
+                        "mode": "deps",
+                        "dependencies": result,
+                    })
+                }
+                "dependents" => {
+                    let deps = graph.get_dependents(entity_id);
+                    let result: Vec<serde_json::Value> = deps
+                        .iter()
+                        .map(|d| {
+                            serde_json::json!({
+                                "name": d.name, "type": d.entity_type,
+                                "file": d.file_path, "lines": [d.start_line, d.end_line],
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "entity": params.entity_name,
+                        "file": rel_path,
+                        "mode": "dependents",
+                        "dependents": result,
+                    })
+                }
+                _ => unreachable!(),
+            };
+
+            output["elapsed_ms"] = serde_json::json!(start.elapsed().as_millis() as u64);
+            output["source"] = serde_json::json!("local");
+            return Ok(CallToolResult::success(vec![Content::text(
+                crate::render::impact_text(&output),
+            )]));
+        }
+
+        let (graph, all_entities) = if no_default_excludes {
+            let file_paths = match Self::find_supported_files_with_options(
+                &ctx.repo_root,
+                &self.registry,
+                no_default_excludes,
+            ) {
+                Ok(file_paths) => file_paths,
+                Err(err) => return Ok(tool_error(err)),
+            };
+            let source_scope = Self::cache_source_scope(&ctx.repo_root, no_default_excludes);
+            self.get_or_build_graph(&ctx.repo_root, &file_paths, source_scope)
+                .await
+        } else {
+            self.live_graph(&ctx.repo_root).await
+        };
+
+        let entity_id = match Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path) {
+            Ok(entity_id) => entity_id,
+            Err(err) => return Ok(tool_error(err)),
+        };
+
+        let mut output = match mode {
             "tests" => {
-                let tests = graph.test_impact(entity_id, &all_entities);
+                let tests = graph.test_impact_with_custom_dirs(
+                    entity_id,
+                    &all_entities,
+                    &self.registry.custom_test_dirs,
+                );
                 let result: Vec<serde_json::Value> = tests
                     .iter()
-                    .map(|d| serde_json::json!({
-                        "name": d.name, "type": d.entity_type,
-                        "file": d.file_path, "lines": [d.start_line, d.end_line],
-                    }))
+                    .map(|d| {
+                        serde_json::json!({
+                            "name": d.name, "type": d.entity_type,
+                            "file": d.file_path, "lines": [d.start_line, d.end_line],
+                        })
+                    })
                     .collect();
                 serde_json::json!({
                     "entity": params.entity_name,
@@ -619,19 +1561,29 @@ impl SemServer {
                     "tests": result,
                 })
             }
+            "deps" | "dependents" => unreachable!(),
             _ => {
                 // "all" mode: everything
                 let deps = graph.get_dependencies(entity_id);
                 let dependents = graph.get_dependents(entity_id);
                 let impact = graph.impact_analysis(entity_id);
-                let tests = graph.test_impact(entity_id, &all_entities);
+                let tests = graph.test_impact_with_custom_dirs(
+                    entity_id,
+                    &all_entities,
+                    &self.registry.custom_test_dirs,
+                );
 
-                let map_entities = |list: &[&sem_core::parser::graph::EntityInfo]| -> Vec<serde_json::Value> {
-                    list.iter().map(|d| serde_json::json!({
-                        "name": d.name, "type": d.entity_type,
-                        "file": d.file_path, "lines": [d.start_line, d.end_line],
-                    })).collect()
-                };
+                let map_entities =
+                    |list: &[&sem_core::parser::graph::EntityInfo]| -> Vec<serde_json::Value> {
+                        list.iter()
+                            .map(|d| {
+                                serde_json::json!({
+                                    "name": d.name, "type": d.entity_type,
+                                    "file": d.file_path, "lines": [d.start_line, d.end_line],
+                                })
+                            })
+                            .collect()
+                    };
 
                 serde_json::json!({
                     "entity": params.entity_name,
@@ -648,22 +1600,66 @@ impl SemServer {
             }
         };
 
+        output["elapsed_ms"] = serde_json::json!(start.elapsed().as_millis() as u64);
+        output["source"] = serde_json::json!("local");
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&output).unwrap_or_default(),
+            crate::render::impact_text(&output),
         )]))
     }
 
     // ── Tool 5: Log ──
+    // (entity-path params after the optional entity has been resolved)
 
-    #[tool(description = "Entity evolution history: trace how a specific entity changed across git commits, distinguishing logic changes from cosmetic ones")]
+    #[tool(
+        description = "Entity evolution history: trace how a specific entity changed across git commits, distinguishing logic changes from cosmetic ones. Omit entity_name for repo-level history analytics: hotspots (most-changed entities, with author counts) and co-change pairs (entities that repeatedly change in the same commits) — the time axis a snapshot dependency graph can't see."
+    )]
     async fn sem_log(
         &self,
         Parameters(params): Parameters<LogParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let ctx = self
-            .get_context(params.file_path.as_deref())
-            .await
-            .map_err(internal_err)?;
+        let start = Instant::now();
+        let ctx = match self.get_context(params.file_path.as_deref()).await {
+            Ok(ctx) => ctx,
+            Err(err) => return Ok(tool_error(err)),
+        };
+
+        // No entity: repo-level history analytics (hotspots + co-changes).
+        let Some(entity_name) = params.entity_name else {
+            let limit = params.limit.unwrap_or(50);
+            let (rel_file, analytics) = {
+                let rel_file = params.file_path.as_ref().map(|fp| {
+                    let (rel, _) = Self::resolve_file_path(&ctx.repo_root, fp);
+                    rel
+                });
+                // Semantic commit index first (each commit diffed once, ever);
+                // live walk only when the cache is unusable.
+                let analytics = crate::cache::history_analytics_from_store(
+                    &ctx.repo_root,
+                    &ctx.git,
+                    &self.registry,
+                    rel_file.as_deref(),
+                    limit,
+                )
+                .unwrap_or_else(|| {
+                    sem_core::parser::hotspot::compute_history_analytics(
+                        &ctx.git,
+                        &self.registry,
+                        rel_file.as_deref(),
+                        limit,
+                    )
+                });
+                (rel_file, analytics)
+            };
+            let _ = rel_file;
+            let mut text = crate::render::history_text(&analytics);
+            text.push_str(&format!("{}ms · local\n", start.elapsed().as_millis()));
+            return Ok(CallToolResult::success(vec![Content::text(text)]));
+        };
+        let params = ResolvedLogParams {
+            entity_name,
+            file_path: params.file_path,
+            limit: params.limit,
+        };
 
         // Resolve file path: use provided or auto-detect
         let file_path = match params.file_path {
@@ -672,8 +1668,10 @@ impl SemServer {
                 rel
             }
             None => {
-                let files = Self::find_supported_files(&ctx.repo_root, &self.registry)
-                    .map_err(internal_err)?;
+                let files = match Self::find_supported_files(&ctx.repo_root, &self.registry) {
+                    Ok(files) => files,
+                    Err(err) => return Ok(tool_error(err)),
+                };
                 let mut found_in: Vec<String> = Vec::new();
                 for fp in &files {
                     let full = ctx.repo_root.join(fp);
@@ -688,14 +1686,14 @@ impl SemServer {
                 }
                 match found_in.len() {
                     0 => {
-                        return Err(internal_err(format!(
+                        return Ok(tool_error(format!(
                             "Entity '{}' not found in any file",
                             params.entity_name
                         )))
                     }
                     1 => found_in.into_iter().next().unwrap(),
                     _ => {
-                        return Err(internal_err(format!(
+                        return Ok(tool_error(format!(
                             "Entity '{}' found in multiple files: {}. Specify file_path to disambiguate.",
                             params.entity_name,
                             found_in.join(", ")
@@ -705,124 +1703,70 @@ impl SemServer {
             }
         };
 
-        let plugin = self
-            .registry
-            .get_plugin(&file_path)
-            .ok_or_else(|| internal_err(format!("No parser for file: {}", file_path)))?;
-
         let limit = params.limit.unwrap_or(50);
-        let commits = ctx
+        let use_file_history = ctx
             .git
-            .get_file_commits(&file_path, limit)
-            .map_err(|e| internal_err(format!("Failed to get file history: {}", e)))?;
+            .get_head_sha()
+            .ok()
+            .and_then(|head| {
+                mcp_entity_by_name_at_ref(
+                    &ctx.git,
+                    &self.registry,
+                    &head,
+                    &file_path,
+                    &params.entity_name,
+                )
+            })
+            .is_some();
+
+        let mut commits = if use_file_history {
+            match ctx.git.get_file_commits_follow_renames(&file_path, 0) {
+                Ok(file_commits) if !file_commits.is_empty() => {
+                    file_commits.into_iter().map(|info| info.commit).collect()
+                }
+                Ok(_) => match ctx.git.get_log(0) {
+                    Ok(log) => log,
+                    Err(e) => return Ok(tool_error(format!("Failed to get history: {}", e))),
+                },
+                Err(e) => return Ok(tool_error(format!("Failed to get file history: {}", e))),
+            }
+        } else {
+            match ctx.git.get_log(0) {
+                Ok(log) => log,
+                Err(e) => return Ok(tool_error(format!("Failed to get history: {}", e))),
+            }
+        };
 
         if commits.is_empty() {
-            return Err(internal_err(format!("No commits found for {}", file_path)));
+            return Ok(tool_error(format!("No commits found for {}", file_path)));
         }
+        commits.reverse();
 
-        let mut entries: Vec<serde_json::Value> = Vec::new();
-        let mut prev_entity_content: Option<String> = None;
-        let mut prev_structural_hash: Option<String> = None;
-        let mut entity_type = String::new();
-        let mut found_at_least_once = false;
-
-        // Process oldest to newest
-        for commit in commits.iter().rev() {
-            let content = match ctx.git.read_file_at_ref(&commit.sha, &file_path) {
-                Ok(Some(c)) => c,
-                _ => {
-                    if prev_entity_content.is_some() {
-                        let date = chrono_lite_format(commit.date.parse::<i64>().unwrap_or(0));
-                        entries.push(serde_json::json!({
-                            "commit": commit.short_sha,
-                            "author": commit.author,
-                            "date": date,
-                            "message": commit.message.lines().next().unwrap_or(""),
-                            "change_type": "deleted",
-                        }));
-                        prev_entity_content = None;
-                        prev_structural_hash = None;
-                    }
-                    continue;
-                }
-            };
-
-            let file_entities = plugin.extract_entities(&content, &file_path);
-            let entity = file_entities.iter().find(|e| e.name == params.entity_name);
-            let date = chrono_lite_format(commit.date.parse::<i64>().unwrap_or(0));
-            let msg = commit.message.lines().next().unwrap_or("").to_string();
-
-            match entity {
-                Some(ent) => {
-                    if !found_at_least_once {
-                        entity_type = ent.entity_type.clone();
-                    }
-
-                    if !found_at_least_once || prev_entity_content.is_none() {
-                        found_at_least_once = true;
-                        entries.push(serde_json::json!({
-                            "commit": commit.short_sha,
-                            "author": commit.author,
-                            "date": date,
-                            "message": msg,
-                            "change_type": "added",
-                        }));
-                    } else {
-                        let prev_hash = prev_entity_content
-                            .as_ref()
-                            .map(|c| sem_core::utils::hash::content_hash(c));
-                        let content_changed =
-                            prev_hash.as_deref() != Some(ent.content_hash.as_str());
-
-                        if content_changed {
-                            let structural_changed = match (
-                                ent.structural_hash.as_deref(),
-                                prev_structural_hash.as_deref(),
-                            ) {
-                                (Some(cur), Some(prev)) => cur != prev,
-                                _ => true,
-                            };
-
-                            let change_type = if structural_changed {
-                                "modified (logic)"
-                            } else {
-                                "modified (cosmetic)"
-                            };
-
-                            entries.push(serde_json::json!({
-                                "commit": commit.short_sha,
-                                "author": commit.author,
-                                "date": date,
-                                "message": msg,
-                                "change_type": change_type,
-                            }));
-                        }
-                    }
-
-                    prev_entity_content = Some(ent.content.clone());
-                    prev_structural_hash = ent.structural_hash.clone();
-                }
-                None => {
-                    if prev_entity_content.is_some() {
-                        entries.push(serde_json::json!({
-                            "commit": commit.short_sha,
-                            "author": commit.author,
-                            "date": date,
-                            "message": msg,
-                            "change_type": "deleted",
-                        }));
-                        prev_entity_content = None;
-                        prev_structural_hash = None;
-                    }
-                }
-            }
-        }
-
-        if !found_at_least_once {
-            return Err(internal_err(format!(
+        let Some(seed) = mcp_find_seed_occurrence(
+            &ctx.git,
+            &self.registry,
+            &commits,
+            &params.entity_name,
+            Some(&file_path),
+        ) else {
+            return Ok(tool_error(format!(
                 "Entity '{}' not found in any commit of {}",
                 params.entity_name, file_path
             )));
+        };
+
+        let entity_type = seed.entity.entity_type.clone();
+        let mut entries =
+            mcp_trace_back_to_origin(&ctx.git, &self.registry, &commits, seed.clone());
+        entries.extend(mcp_trace_forward_from_seed(
+            &ctx.git,
+            &self.registry,
+            &commits,
+            seed,
+        ));
+        if limit != 0 && entries.len() > limit {
+            let drop_count = entries.len() - limit;
+            entries.drain(0..drop_count);
         }
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -839,33 +1783,130 @@ impl SemServer {
 
     // ── Tool 6: Context ──
 
-    #[tool(description = "Pack optimal entity context into a token budget. Priority: target entity (full) > direct dependents (full) > transitive (signature only).")]
+    #[tool(
+        description = "Pack optimal entity context into a token budget. Priority: target entity > direct dependencies > direct dependents > transitive dependencies > transitive dependents."
+    )]
     async fn sem_context(
         &self,
         Parameters(params): Parameters<ContextParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let ctx = self
-            .get_context(Some(&params.file_path))
-            .await
-            .map_err(internal_err)?;
-        let (rel_path, _) = Self::resolve_file_path(&ctx.repo_root, &params.file_path);
-
-        let file_paths =
-            Self::find_supported_files(&ctx.repo_root, &self.registry).map_err(internal_err)?;
-        let (graph, all_entities) = self.get_or_build_graph(&ctx.repo_root, &file_paths).await;
-
-        let entity_id = Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path)?;
-
+        // Time the whole handler so the result carries the real latency the
+        // agent waited on — let the speed be felt, not claimed.
+        let start = Instant::now();
+        let ctx = match self.get_context(params.file_path.as_deref()).await {
+            Ok(ctx) => ctx,
+            Err(err) => return Ok(tool_error(err)),
+        };
+        // With a file hint, validate it up front; without one, the entity is
+        // resolved repo-wide after the graph is available (one-call lookup).
+        let explicit_rel: Option<String> = match params.file_path.as_deref() {
+            Some(fp) => {
+                let (rel_path, abs_path) = Self::resolve_file_path(&ctx.repo_root, fp);
+                if let Some(err) = file_path_error(fp, &abs_path) {
+                    return Ok(tool_error(err));
+                }
+                if self.registry.get_plugin(&rel_path).is_none() {
+                    return Ok(tool_error(format!("No parser for file: {}", rel_path)));
+                }
+                Some(rel_path)
+            }
+            None => None,
+        };
+        let no_default_excludes = params.no_default_excludes.unwrap_or(false);
         let budget = params.token_budget.unwrap_or(8000);
-        let entries = sem_core::parser::context::build_context(
+        let hops = params.hops.unwrap_or(0);
+
+        // File-hinted queries stay local (same gate as the CLI, #409): the
+        // cloud resolves by name with a silent name-only fallback, so it can
+        // return the wrong same-named entity, and the attempt costs a network
+        // round-trip (~140ms) before the warm in-memory graph answers in
+        // milliseconds. Cloud returns here once the server resolves name+file
+        // strictly. SEM_MCP_CLOUD=1 opts back in for experiments.
+        if !no_default_excludes && std::env::var("SEM_MCP_CLOUD").is_ok_and(|v| v == "1") {
+            if let Some(rel_path) = explicit_rel.as_deref() {
+                if let Some(mut out) =
+                    crate::cloud::try_context(&ctx.git, &params.entity_name, rel_path, budget, hops)
+                {
+                    out["elapsed_ms"] = serde_json::json!(start.elapsed().as_millis() as u64);
+                    out["source"] = serde_json::json!("cloud");
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        crate::render::context_text(&out),
+                    )]));
+                }
+            }
+        }
+
+        let (graph, all_entities) = if no_default_excludes {
+            let file_paths = match Self::find_supported_files_with_options(
+                &ctx.repo_root,
+                &self.registry,
+                no_default_excludes,
+            ) {
+                Ok(file_paths) => file_paths,
+                Err(err) => return Ok(tool_error(err)),
+            };
+            let source_scope = Self::cache_source_scope(&ctx.repo_root, no_default_excludes);
+            self.get_or_build_graph(&ctx.repo_root, &file_paths, source_scope)
+                .await
+        } else {
+            self.live_graph(&ctx.repo_root).await
+        };
+
+        let (entity_id, rel_path) = match explicit_rel {
+            Some(rel_path) => {
+                match Self::find_entity_in_graph(&graph, &params.entity_name, &rel_path) {
+                    Ok(entity_id) => (entity_id.to_string(), rel_path),
+                    Err(err) => return Ok(tool_error(err)),
+                }
+            }
+            None => match Self::find_entity_repo_wide(&graph, &params.entity_name) {
+                Ok(entity) => (entity.id.clone(), entity.file_path.clone()),
+                Err(err) => return Ok(tool_error(err)),
+            },
+        };
+        let entity_id = entity_id.as_str();
+        let context_result = sem_core::parser::context::build_context_result_bounded(
             &graph,
             entity_id,
             &all_entities,
             budget,
+            hops,
         );
 
-        let total_tokens: usize = entries.iter().map(|e| e.estimated_tokens).sum();
-        let result: Vec<serde_json::Value> = entries
+        // Attention ledger (MCP path): one MCP server process serves exactly
+        // one agent session, so a process-constant session key is correct.
+        // Repeats answer as one line, changed entities as a delta against the
+        // version the session saw. `fresh: true` bypasses (e.g. after context
+        // compaction dropped the earlier fill).
+        if !params.fresh.unwrap_or(false) {
+            let target_content = all_entities
+                .iter()
+                .find(|e| e.id == entity_id)
+                .map(|e| e.content.as_str())
+                .unwrap_or("");
+            let packed_marker = format!(
+                "{}:{}",
+                context_result.total_tokens,
+                context_result.entries.len()
+            );
+            if let Some(reply) = self
+                .ledger_reply(
+                    "mcp",
+                    entity_id,
+                    &params.entity_name,
+                    &rel_path,
+                    target_content,
+                    &packed_marker,
+                    "pass fresh: true for the full re-pack",
+                )
+                .await
+            {
+                return Ok(CallToolResult::success(vec![Content::text(reply)]));
+            }
+        }
+
+        let result: Vec<serde_json::Value> = context_result
+            .entries
             .iter()
             .map(|e| {
                 serde_json::json!({
@@ -880,49 +1921,1400 @@ impl SemServer {
             .collect();
 
         Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&serde_json::json!({
+            crate::render::context_text(&serde_json::json!({
                 "entity": params.entity_name,
                 "file": rel_path,
                 "token_budget": budget,
-                "tokens_used": total_tokens,
+                "tokens_used": context_result.total_tokens,
+                "truncated": context_result.truncated,
+                "target_omitted": context_result.target_omitted,
                 "entries": result.len(),
                 "context": result,
-            }))
-            .unwrap_or_default(),
+                "omitted": omitted_tails_json(&context_result),
+                "elapsed_ms": start.elapsed().as_millis() as u64,
+                "source": "local",
+            })),
         )]))
     }
+}
+
+/// One recorded context fill in the attention ledger.
+#[derive(Clone)]
+struct LedgerFill {
+    fingerprint: String,
+    content: String,
+}
+
+fn fnv1a_hash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Per-role counts of entities the packer deliberately left out (tests,
+/// stub signatures, past-cap transitive tails), for the render footer.
+fn omitted_tails_json(
+    context_result: &sem_core::parser::context::ContextResult,
+) -> Vec<serde_json::Value> {
+    context_result
+        .omitted
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "role": t.role,
+                "entities": t.entities,
+                "tests": t.tests,
+            })
+        })
+        .collect()
 }
 
 #[tool_handler]
 impl ServerHandler for SemServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "sem MCP server for entity-level semantic code intelligence. \
-             6 tools: entities, diff, blame, impact, log, context.",
-        )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(MCP_INSTRUCTIONS)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sem_core::parser::plugins::create_default_registry;
+    use std::fs;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::TempDir;
+
+    fn git(repo: &TempDir, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(repo.path())
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {:?} failed", args);
+    }
+
+    fn commit_all_tempdir(repo: &TempDir, message: &str, timestamp: i64) {
+        git(repo, &["add", "-A"]);
+        let status = Command::new("git")
+            .current_dir(repo.path())
+            .env("GIT_AUTHOR_DATE", format!("@{timestamp}"))
+            .env("GIT_COMMITTER_DATE", format!("@{timestamp}"))
+            .args(["commit", "-q", "-m", message])
+            .status()
+            .unwrap();
+        assert!(status.success(), "git commit failed");
+    }
+
+    fn rename_history_repo() -> TempDir {
+        let repo = TempDir::new().unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "t@t.com"]);
+        git(&repo, &["config", "user.name", "test"]);
+        fs::write(repo.path().join("a.py"), "def original(): return 1\n").unwrap();
+        commit_all_tempdir(&repo, "v1", 946684800);
+        fs::write(repo.path().join("a.py"), "def renamed_func(): return 1\n").unwrap();
+        commit_all_tempdir(&repo, "v2: rename function", 946771200);
+        git(&repo, &["mv", "a.py", "b.py"]);
+        commit_all_tempdir(&repo, "v3: move file", 946857600);
+        fs::write(repo.path().join("b.py"), "def renamed_func(): return 2\n").unwrap();
+        commit_all_tempdir(&repo, "v4: modify body", 946944000);
+        repo
+    }
+
+    fn mcp_log_labels(repo: &TempDir, entity_name: &str, file_path: &str) -> Vec<String> {
+        let git = GitBridge::open(repo.path()).unwrap();
+        let registry = create_default_registry();
+        let mut commits = if git
+            .get_head_sha()
+            .ok()
+            .and_then(|head| {
+                mcp_entity_by_name_at_ref(&git, &registry, &head, file_path, entity_name)
+            })
+            .is_some()
+        {
+            git.get_file_commits_follow_renames(file_path, 0)
+                .unwrap()
+                .into_iter()
+                .map(|info| info.commit)
+                .collect()
+        } else {
+            git.get_log(0).unwrap()
+        };
+        commits.reverse();
+        let seed =
+            mcp_find_seed_occurrence(&git, &registry, &commits, entity_name, Some(file_path))
+                .unwrap();
+        let mut entries = mcp_trace_back_to_origin(&git, &registry, &commits, seed.clone());
+        entries.extend(mcp_trace_forward_from_seed(&git, &registry, &commits, seed));
+        entries
+            .iter()
+            .map(|entry| entry["change_type"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn temp_dir() -> PathBuf {
+        let name = format!(
+            "sem-mcp-files-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(name);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn temp_git_repo(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("sem-mcp-{}-{}-{}", name, std::process::id(), nanos));
+        std::fs::create_dir_all(&root).unwrap();
+        git2::Repository::init(&root).unwrap();
+        root
+    }
+
+    fn commit_all(root: &Path, message: &str, removals: &[&str]) {
+        let repo = git2::Repository::open(root).unwrap();
+        let sig = git2::Signature::now("sem test", "sem@example.com").unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        for path in removals {
+            index.remove_path(Path::new(path)).unwrap();
+        }
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let parent = repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(|oid| repo.find_commit(oid).unwrap());
+        let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+
+        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
+            .unwrap();
+    }
+
+    fn assert_tool_error(result: CallToolResult, expected_text: &str) {
+        let value = serde_json::to_value(result).unwrap();
+
+        assert_eq!(value["isError"], true);
+        assert_eq!(value["content"][0]["type"], "text");
+        assert!(
+            value["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(expected_text),
+            "expected tool error to contain {expected_text:?}, got {value}"
+        );
+    }
+
+    fn text_of(result: CallToolResult) -> String {
+        match &result.content.first().unwrap().raw {
+            rmcp::model::RawContent::Text(text) => text.text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    fn assert_tool_success(result: CallToolResult) {
+        let value = serde_json::to_value(result).unwrap();
+
+        assert_eq!(value["isError"], false);
+    }
+
+    #[test]
+    fn entity_lookup_candidate_list_is_bounded() {
+        let candidates = [
+            "a.py", "b.py", "c.py", "d.py", "e.py", "f.py", "g.py", "h.py", "i.py", "j.py", "k.py",
+            "l.py",
+        ];
+
+        assert_eq!(
+            format_entity_lookup_candidates(&candidates),
+            "a.py, b.py, c.py, d.py, e.py, f.py, g.py, h.py, i.py, j.py (+2 more)"
+        );
+    }
+
+    async fn server_for_repo(root: &Path) -> SemServer {
+        let server = SemServer::new();
+        let git = GitBridge::open(root).unwrap();
+        let repo_root = git.repo_root().to_path_buf();
+        *server.context.lock().await = Some(RepoContext { git, repo_root });
+        server
+    }
 
     #[test]
     fn find_supported_files_returns_walk_errors() {
-        let missing_root = std::env::temp_dir().join(format!(
-            "sem-mcp-missing-root-{}",
-            std::process::id()
-        ));
+        let missing_root =
+            std::env::temp_dir().join(format!("sem-mcp-missing-root-{}", std::process::id()));
         let registry = ParserRegistry::new();
 
         let err = SemServer::find_supported_files(&missing_root, &registry).unwrap_err();
 
         assert!(err.contains("Failed to read directory"));
     }
+
+    #[tokio::test]
+    async fn live_graph_reflects_working_tree_edits_via_watcher() {
+        // Proves the watcher keeps the in-memory graph in sync with on-disk
+        // edits: after renaming an entity, the live graph must surface the new
+        // name without restarting the server.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("a.rs"), "pub fn alpha() -> i32 { 1 }\n").unwrap();
+
+        let server = SemServer::new();
+
+        // First build seeds the watcher and caches the graph.
+        let (graph, _) = server.live_graph(root).await;
+        assert!(
+            graph.entities.values().any(|e| e.name == "alpha"),
+            "initial graph should contain alpha"
+        );
+        assert!(
+            !graph.entities.values().any(|e| e.name == "beta"),
+            "initial graph should not contain beta"
+        );
+
+        // Edit on disk: rename the entity. content_hash differs, so the change
+        // is detected even within the same mtime tick.
+        std::fs::write(root.join("a.rs"), "pub fn beta() -> i32 { 2 }\n").unwrap();
+
+        // Poll until the watcher delivers the event and the rebuild lands.
+        let mut saw_beta = false;
+        for _ in 0..150 {
+            let (graph, _) = server.live_graph(root).await;
+            if graph.entities.values().any(|e| e.name == "beta") {
+                saw_beta = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            saw_beta,
+            "live graph should reflect the renamed entity after the edit"
+        );
+    }
+
+    #[test]
+    fn get_info_instructions_reference_registered_tool_names() {
+        let info = SemServer::new().get_info();
+
+        assert_eq!(info.instructions.as_deref(), Some(MCP_INSTRUCTIONS));
+        assert!(MCP_INSTRUCTIONS.contains("sem_entities"));
+        assert!(!MCP_INSTRUCTIONS.contains("tools: entities"));
+    }
+
+    #[tokio::test]
+    async fn sem_diff_returns_cli_json_envelope() {
+        let temp = tempfile::tempdir().unwrap();
+        run_git(temp.path(), &["init"]);
+        run_git(temp.path(), &["config", "user.name", "Sem Test"]);
+        run_git(temp.path(), &["config", "user.email", "sem@example.com"]);
+
+        let file_path = temp.path().join("a.py");
+        std::fs::write(&file_path, "def foo():\n    return 1\n").unwrap();
+        run_git(temp.path(), &["add", "a.py"]);
+        run_git(temp.path(), &["commit", "-m", "initial"]);
+
+        std::fs::write(
+            &file_path,
+            "def foo():\n    return 1\n\n\ndef bar():\n    return 2\n",
+        )
+        .unwrap();
+        let file_path = std::fs::canonicalize(file_path).unwrap();
+
+        let result = SemServer::new()
+            .sem_diff(Parameters(DiffParams {
+                base_ref: None,
+                target_ref: None,
+                file_path: Some(file_path.to_string_lossy().to_string()),
+            }))
+            .await
+            .unwrap();
+
+        let text = match &result.content.first().unwrap().raw {
+            rmcp::model::RawContent::Text(text) => &text.text,
+            other => panic!("expected text content, got {other:?}"),
+        };
+        let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        let changes = payload["changes"].as_array().unwrap();
+        let change = changes.first().unwrap();
+
+        assert!(payload.get("summary").is_some());
+        assert_eq!(payload["summary"]["fileCount"], 1);
+        assert_eq!(payload["summary"]["total"], changes.len());
+        assert!(payload.get("base_ref").is_none());
+        assert!(payload.get("files_analyzed").is_none());
+        assert!(change.get("entityId").is_some());
+        assert!(change.get("changeType").is_some());
+        assert!(change.get("filePath").is_some());
+        assert!(change.get("entity_name").is_none());
+        assert!(change.get("change_type").is_none());
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed\nstdout:\n{}\nstderr:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn mcp_log_helpers_trace_current_and_historical_names() {
+        let repo = rename_history_repo();
+        let expected = vec!["added", "renamed", "moved", "modified (logic)"];
+        assert_eq!(mcp_log_labels(&repo, "renamed_func", "b.py"), expected);
+        assert_eq!(mcp_log_labels(&repo, "original", "a.py"), expected);
+    }
+
+    #[test]
+    fn find_supported_files_skips_binary_and_default_excludes() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("src/generated")).unwrap();
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::write(root.join("src/app.js"), "export function app() {}\n").unwrap();
+        fs::write(root.join("src/blob.weird"), b"abc\0def").unwrap();
+        fs::write(root.join("src/icon.png"), b"\x89PNG\r\n").unwrap();
+        fs::write(
+            root.join("src/generated/schema.ts"),
+            "export function generatedSchema() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/api.generated.ts"),
+            "export function generatedApi() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/styles.module.scss.d.ts"),
+            "declare const styles: Record<string, string>;\nexport default styles;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/logo.svg.d.ts"),
+            "declare const src: string;\nexport default src;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("dist/generated.js"),
+            "export function generated() {}\n",
+        )
+        .unwrap();
+
+        let registry = create_default_registry();
+        let files = SemServer::find_supported_files(&root, &registry).unwrap();
+
+        assert_eq!(files, vec!["src/app.js".to_string()]);
+
+        let files_with_generated =
+            SemServer::find_supported_files_with_options(&root, &registry, true).unwrap();
+        assert!(files_with_generated.contains(&"src/app.js".to_string()));
+        assert!(files_with_generated.contains(&"src/generated/schema.ts".to_string()));
+        assert!(files_with_generated.contains(&"src/api.generated.ts".to_string()));
+        assert!(files_with_generated.contains(&"src/styles.module.scss.d.ts".to_string()));
+        assert!(files_with_generated.contains(&"src/logo.svg.d.ts".to_string()));
+        assert!(files_with_generated.contains(&"dist/generated.js".to_string()));
+        assert!(!files_with_generated.contains(&"src/blob.weird".to_string()));
+        assert!(!files_with_generated.contains(&"src/icon.png".to_string()));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn normalize_relative_path_returns_dot_for_empty_paths() {
+        assert_eq!(normalize_relative_path(Path::new("")), PathBuf::from("."));
+        assert_eq!(normalize_relative_path(Path::new("./")), PathBuf::from("."));
+        assert_eq!(
+            normalize_relative_path(Path::new("src/../sample.py")),
+            PathBuf::from("sample.py")
+        );
+        assert_eq!(
+            normalize_relative_path(Path::new("a/../b")),
+            PathBuf::from("b")
+        );
+        assert_eq!(
+            normalize_relative_path(Path::new("a/b/../../c")),
+            PathBuf::from("c")
+        );
+        assert_eq!(
+            normalize_relative_path(Path::new("a/../../b")),
+            PathBuf::from("../b")
+        );
+    }
+
+    #[test]
+    fn resolve_file_path_normalizes_missing_relative_paths_lexically() {
+        let root = temp_git_repo("missing-relative-normalize");
+
+        let (rel_path, abs_path) = SemServer::resolve_file_path(&root, "./missing.py");
+
+        assert_eq!(rel_path, "missing.py");
+        assert_eq!(abs_path, root.join("./missing.py"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn path_to_slash_converts_backslashes() {
+        assert_eq!(path_to_slash(Path::new("a\\b\\c.py")), "a/b/c.py");
+        assert_eq!(path_to_slash(Path::new("a/b/c.py")), "a/b/c.py");
+    }
+
+    #[test]
+    fn resolve_file_path_returns_forward_slashes() {
+        let root = temp_git_repo("forward-slash-relative");
+
+        let (rel_path, _) = SemServer::resolve_file_path(&root, "src/inner/file.py");
+
+        assert_eq!(rel_path, "src/inner/file.py");
+        assert!(!rel_path.contains('\\'));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn attention_ledger_covers_mcp_context_tool_with_fresh_bypass() {
+        let root = temp_git_repo("ledger-mcp");
+        std::fs::write(root.join("app.py"), "def gamma():\n    return 7\n").unwrap();
+        let server = server_for_repo(&root).await;
+        let params = || ContextParams {
+            file_path: None,
+            entity_name: "gamma".to_string(),
+            token_budget: Some(2000),
+            hops: Some(1),
+            no_default_excludes: None,
+            fresh: None,
+        };
+
+        let first = text_of(server.sem_context(Parameters(params())).await.unwrap());
+        assert!(first.contains("def gamma()"));
+
+        let second = text_of(server.sem_context(Parameters(params())).await.unwrap());
+        assert!(second.contains("unchanged since you read it"), "{second}");
+
+        let mut p3 = params();
+        p3.fresh = Some(true);
+        let third = text_of(server.sem_context(Parameters(p3)).await.unwrap());
+        assert!(third.contains("def gamma()"), "fresh bypasses: {third}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn attention_ledger_returns_delta_for_changed_entity() {
+        let server = SemServer::new();
+        let v1 = "def alpha():\n    return 1\n";
+        let v2 = "def alpha():\n    return 2\n";
+
+        let first = server
+            .ledger_reply("s", "id1", "alpha", "a.py", v1, "10:1", "hint")
+            .await;
+        assert!(first.is_none(), "first fill goes out in full");
+
+        let delta = server
+            .ledger_reply("s", "id1", "alpha", "a.py", v2, "11:1", "hint")
+            .await
+            .expect("changed entity answers with a delta");
+        assert!(
+            delta.contains("∆ alpha · changed since you read it"),
+            "{delta}"
+        );
+        assert!(delta.contains("-     return 1"));
+        assert!(delta.contains("+     return 2"));
+
+        let repeat = server
+            .ledger_reply("s", "id1", "alpha", "a.py", v2, "11:1", "hint")
+            .await
+            .expect("repeat after the delta is an unchanged line");
+        assert!(repeat.contains("unchanged since you read it"));
+    }
+
+    #[tokio::test]
+    async fn attention_ledger_suppresses_repeated_identical_fill() {
+        let root = temp_git_repo("ledger-repeat");
+        std::fs::write(
+            root.join("app.py"),
+            "def alpha():\n    return 1\n\ndef beta():\n    return alpha()\n",
+        )
+        .unwrap();
+        let server = server_for_repo(&root).await;
+
+        let first = server
+            .quick_context(&root, "alpha", 2000, 1, Some("sess-1"))
+            .await
+            .expect("first fill");
+        assert!(first.contains("def alpha()"), "first fill carries the body");
+
+        let second = server
+            .quick_context(&root, "alpha", 2000, 1, Some("sess-1"))
+            .await
+            .expect("second fill");
+        assert!(
+            second.contains("unchanged since you read it"),
+            "repeat in the same session collapses to one line: {second}"
+        );
+        assert!(!second.contains("def alpha()"));
+
+        // A different session gets the full body again.
+        let other = server
+            .quick_context(&root, "alpha", 2000, 1, Some("sess-2"))
+            .await
+            .expect("other session fill");
+        assert!(other.contains("def alpha()"));
+
+        // No session key: never suppressed.
+        let anon = server
+            .quick_context(&root, "alpha", 2000, 1, None)
+            .await
+            .expect("anonymous fill");
+        assert!(anon.contains("def alpha()"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_entities_returns_tool_error_for_missing_path() {
+        let root = temp_git_repo("missing-path");
+        let missing_path = root.join("nonexistent_path.py");
+        let server = SemServer::new();
+
+        let result = server
+            .sem_entities(Parameters(EntitiesParams {
+                path: Some(missing_path.display().to_string()),
+                no_default_excludes: None,
+                query: None,
+                limit: None,
+                text: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_error(result, "Path not found:");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_entities_can_opt_into_generated_file_path() {
+        let root = temp_git_repo("generated-entities-file");
+        std::fs::create_dir_all(root.join("src/generated")).unwrap();
+        std::fs::write(
+            root.join("src/generated/schema.ts"),
+            "export function generatedTarget() { return 1; }\n",
+        )
+        .unwrap();
+        let server = server_for_repo(&root).await;
+
+        let default_result = server
+            .sem_entities(Parameters(EntitiesParams {
+                path: Some("src/generated/schema.ts".to_string()),
+                no_default_excludes: None,
+                query: None,
+                limit: None,
+                text: None,
+            }))
+            .await
+            .unwrap();
+        assert_tool_error(default_result, "Path is excluded by default:");
+
+        let opt_in_result = server
+            .sem_entities(Parameters(EntitiesParams {
+                path: Some("src/generated/schema.ts".to_string()),
+                no_default_excludes: Some(true),
+                query: None,
+                limit: None,
+                text: None,
+            }))
+            .await
+            .unwrap();
+
+        let text = match &opt_in_result.content.first().unwrap().raw {
+            rmcp::model::RawContent::Text(text) => &text.text,
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert!(
+            text.lines()
+                .any(|line| line.contains("generatedTarget") && line.contains("function")),
+            "generated target should be returned when default excludes are disabled: {text}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_diff_returns_tool_error_for_missing_file_path() {
+        let root = temp_git_repo("missing-diff-file");
+        let file_path = root.join("missing.py");
+        let server = SemServer::new();
+
+        let result = server
+            .sem_diff(Parameters(DiffParams {
+                base_ref: None,
+                target_ref: None,
+                file_path: Some(file_path.display().to_string()),
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_error(result, "Path not found:");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_diff_allows_ref_range_file_absent_from_working_tree() {
+        let root = temp_git_repo("range-diff-historical-file");
+        std::fs::write(root.join("base.py"), "def base():\n    return 1\n").unwrap();
+        commit_all(&root, "base", &[]);
+        let base_sha = git2::Repository::open(&root)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string();
+
+        let range_file = root.join("branch_only.py");
+        std::fs::write(&range_file, "def branch_only():\n    return 1\n").unwrap();
+        commit_all(&root, "add branch-only file", &[]);
+        let add_sha = git2::Repository::open(&root)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string();
+
+        std::fs::remove_file(&range_file).unwrap();
+        commit_all(&root, "delete branch-only file", &["branch_only.py"]);
+        let server = server_for_repo(&root).await;
+
+        let result = server
+            .sem_diff(Parameters(DiffParams {
+                base_ref: Some(base_sha),
+                target_ref: Some(add_sha),
+                file_path: Some("branch_only.py".to_string()),
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_success(result);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_diff_preserves_invalid_ref_errors_with_file_path() {
+        let root = temp_git_repo("range-diff-invalid-ref");
+        std::fs::write(root.join("sample.py"), "def sample():\n    return 1\n").unwrap();
+        commit_all(&root, "initial", &[]);
+        let server = server_for_repo(&root).await;
+
+        let result = server
+            .sem_diff(Parameters(DiffParams {
+                base_ref: Some("missing-ref".to_string()),
+                target_ref: Some("HEAD".to_string()),
+                file_path: Some("sample.py".to_string()),
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_error(result, "git error:");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_impact_returns_tool_error_for_unknown_entity() {
+        let root = temp_git_repo("unknown-entity");
+        let file_path = root.join("sample.py");
+        std::fs::write(&file_path, "def known_entity():\n    return 1\n").unwrap();
+        let server = SemServer::new();
+
+        let result = server
+            .sem_impact(Parameters(ImpactAnalysisParams {
+                file_path: file_path.display().to_string(),
+                entity_name: "nonexistent_zzz".to_string(),
+                mode: None,
+                no_default_excludes: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_error(result, "Entity 'nonexistent_zzz' not found in 'sample.py'");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_impact_returns_tool_error_for_missing_file_path() {
+        let root = temp_git_repo("missing-impact-file");
+        let file_path = root.join("missing.py");
+        let server = SemServer::new();
+
+        let result = server
+            .sem_impact(Parameters(ImpactAnalysisParams {
+                file_path: file_path.display().to_string(),
+                entity_name: "anything".to_string(),
+                mode: None,
+                no_default_excludes: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_error(result, "Path not found:");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_impact_returns_tool_error_when_entity_is_not_in_file_path() {
+        let root = temp_git_repo("wrong-impact-file");
+        let file_path = root.join("notes.txt");
+        std::fs::write(&file_path, "known_entity\n").unwrap();
+        std::fs::write(
+            root.join("sample.py"),
+            "def known_entity():\n    return 1\n",
+        )
+        .unwrap();
+        let server = SemServer::new();
+
+        let result = server
+            .sem_impact(Parameters(ImpactAnalysisParams {
+                file_path: file_path.display().to_string(),
+                entity_name: "known_entity".to_string(),
+                mode: None,
+                no_default_excludes: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_error(
+            result,
+            "Entity 'known_entity' not found in 'notes.txt' (existing candidates: sample.py)",
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_impact_normalizes_relative_file_path_before_entity_lookup() {
+        let root = temp_git_repo("normalized-impact-file");
+        std::fs::write(
+            root.join("sample.py"),
+            "def known_entity():\n    return 1\n",
+        )
+        .unwrap();
+        let server = server_for_repo(&root).await;
+
+        let result = server
+            .sem_impact(Parameters(ImpactAnalysisParams {
+                file_path: "./sample.py".to_string(),
+                entity_name: "known_entity".to_string(),
+                mode: Some("deps".to_string()),
+                no_default_excludes: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_success(result);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_impact_can_opt_into_generated_files() {
+        let root = temp_git_repo("generated-impact-file");
+        std::fs::create_dir_all(root.join("src/generated")).unwrap();
+        std::fs::write(
+            root.join("src/generated/schema.ts"),
+            "export function generatedTarget() { return 1; }\n",
+        )
+        .unwrap();
+        let server = server_for_repo(&root).await;
+
+        let default_result = server
+            .sem_impact(Parameters(ImpactAnalysisParams {
+                file_path: "src/generated/schema.ts".to_string(),
+                entity_name: "generatedTarget".to_string(),
+                mode: Some("deps".to_string()),
+                no_default_excludes: None,
+            }))
+            .await
+            .unwrap();
+        assert_tool_error(
+            default_result,
+            "Entity 'generatedTarget' not found in 'src/generated/schema.ts'",
+        );
+
+        let opt_in_result = server
+            .sem_impact(Parameters(ImpactAnalysisParams {
+                file_path: "src/generated/schema.ts".to_string(),
+                entity_name: "generatedTarget".to_string(),
+                mode: Some("deps".to_string()),
+                no_default_excludes: Some(true),
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_success(opt_in_result);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_context_can_opt_into_generated_files() {
+        let root = temp_git_repo("generated-context-file");
+        std::fs::create_dir_all(root.join("src/generated")).unwrap();
+        std::fs::write(
+            root.join("src/generated/schema.ts"),
+            "export function generatedTarget() { return 1; }\n",
+        )
+        .unwrap();
+        let server = server_for_repo(&root).await;
+
+        let result = server
+            .sem_context(Parameters(ContextParams {
+                file_path: Some("src/generated/schema.ts".to_string()),
+                entity_name: "generatedTarget".to_string(),
+                token_budget: Some(2000),
+                hops: None,
+                no_default_excludes: Some(true),
+                fresh: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_success(result);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_context_returns_tool_error_when_entity_is_not_in_file_path() {
+        let root = temp_git_repo("wrong-context-file");
+        let file_path = root.join("notes.txt");
+        std::fs::write(&file_path, "known_entity\n").unwrap();
+        std::fs::write(
+            root.join("sample.py"),
+            "def known_entity():\n    return 1\n",
+        )
+        .unwrap();
+        let server = SemServer::new();
+
+        let result = server
+            .sem_context(Parameters(ContextParams {
+                file_path: Some(file_path.display().to_string()),
+                entity_name: "known_entity".to_string(),
+                token_budget: None,
+                hops: None,
+                no_default_excludes: None,
+                fresh: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_error(
+            result,
+            "Entity 'known_entity' not found in 'notes.txt' (existing candidates: sample.py)",
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_context_returns_tool_error_for_unknown_entity() {
+        let root = temp_git_repo("unknown-context-entity");
+        let file_path = root.join("sample.py");
+        std::fs::write(&file_path, "def known_entity():\n    return 1\n").unwrap();
+        let server = SemServer::new();
+
+        let result = server
+            .sem_context(Parameters(ContextParams {
+                file_path: Some(file_path.display().to_string()),
+                entity_name: "nonexistent_zzz".to_string(),
+                token_budget: None,
+                hops: None,
+                no_default_excludes: None,
+                fresh: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_error(result, "Entity 'nonexistent_zzz' not found in 'sample.py'");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn get_context_follows_file_hint_across_repos() {
+        // Regression: the server pinned to the first repo it discovered, so a
+        // graph-backed query (context/impact) for a file in a *second* repo
+        // silently answered from the first repo's graph — "not found" for valid
+        // entities. An explicit file hint must follow into its own repo.
+        let repo_a = temp_git_repo("switch-repo-a");
+        std::fs::write(repo_a.join("a.py"), "def alpha_entity():\n    return 1\n").unwrap();
+        let repo_b = temp_git_repo("switch-repo-b");
+        std::fs::write(repo_b.join("b.py"), "def beta_entity():\n    return 2\n").unwrap();
+
+        let server = SemServer::new();
+
+        // Touch repo A first so it becomes the active repo.
+        let a = server
+            .sem_context(Parameters(ContextParams {
+                file_path: Some(repo_a.join("a.py").display().to_string()),
+                entity_name: "alpha_entity".to_string(),
+                token_budget: None,
+                hops: None,
+                no_default_excludes: None,
+                fresh: None,
+            }))
+            .await
+            .unwrap();
+        assert_tool_success(a);
+
+        // A hint into repo B must resolve B's entity, not answer from repo A.
+        let b = server
+            .sem_context(Parameters(ContextParams {
+                file_path: Some(repo_b.join("b.py").display().to_string()),
+                entity_name: "beta_entity".to_string(),
+                token_budget: None,
+                hops: None,
+                no_default_excludes: None,
+                fresh: None,
+            }))
+            .await
+            .unwrap();
+        let value = serde_json::to_value(b).unwrap();
+        assert_eq!(
+            value["isError"], false,
+            "repo B entity should resolve after switching repos: {value}"
+        );
+        assert!(
+            value["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("beta_entity"),
+            "context should come from repo B, got {value}"
+        );
+
+        let _ = std::fs::remove_dir_all(repo_a);
+        let _ = std::fs::remove_dir_all(repo_b);
+    }
+
+    #[tokio::test]
+    async fn sem_log_allows_deleted_file_path_from_history() {
+        let root = temp_git_repo("deleted-log-file");
+        let file_path = root.join("old.py");
+        std::fs::write(&file_path, "def old_entity():\n    return 1\n").unwrap();
+        commit_all(&root, "add old file", &[]);
+        std::fs::remove_file(&file_path).unwrap();
+        commit_all(&root, "delete old file", &["old.py"]);
+        let server = server_for_repo(&root).await;
+
+        let result = server
+            .sem_log(Parameters(LogParams {
+                entity_name: Some("old_entity".to_string()),
+                file_path: Some("old.py".to_string()),
+                limit: Some(10),
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_success(result);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sem_impact_returns_tool_error_for_invalid_mode() {
+        let root = temp_git_repo("invalid-mode");
+        let file_path = root.join("sample.py");
+        std::fs::write(&file_path, "def known_entity():\n    return 1\n").unwrap();
+        let server = SemServer::new();
+
+        let result = server
+            .sem_impact(Parameters(ImpactAnalysisParams {
+                file_path: file_path.display().to_string(),
+                entity_name: "known_entity".to_string(),
+                mode: Some("invalid".to_string()),
+                no_default_excludes: None,
+            }))
+            .await
+            .unwrap();
+
+        assert_tool_error(result, "Invalid mode 'invalid'");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
-fn internal_err(msg: impl ToString) -> rmcp::ErrorData {
-    rmcp::ErrorData::internal_error(msg.to_string(), None)
+fn tool_error(msg: impl Into<String>) -> CallToolResult {
+    CallToolResult::error(vec![Content::text(msg.into())])
+}
+
+fn format_entity_lookup_candidates(candidates: &[&str]) -> String {
+    let shown = candidates
+        .iter()
+        .take(ENTITY_LOOKUP_CANDIDATE_LIMIT)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining = candidates
+        .len()
+        .saturating_sub(ENTITY_LOOKUP_CANDIDATE_LIMIT);
+
+    if remaining == 0 {
+        shown
+    } else {
+        format!("{shown} (+{remaining} more)")
+    }
+}
+
+fn file_path_error(path: &str, abs_path: &Path) -> Option<String> {
+    if abs_path.is_file() {
+        None
+    } else if abs_path.exists() {
+        Some(format!("Expected file path: {}", path))
+    } else {
+        Some(format!("Path not found: {}", path))
+    }
+}
+
+fn pathspec_error(
+    git: &GitBridge,
+    scope: &DiffScope,
+    rel_path: &str,
+    display_path: &str,
+    abs_path: &Path,
+) -> Option<String> {
+    let found = match scope {
+        DiffScope::Working => abs_path.exists(),
+        DiffScope::Range { from, to } => match (
+            path_exists_at_ref(git, from, rel_path),
+            path_exists_at_ref(git, to, rel_path),
+        ) {
+            (Some(from_found), Some(to_found)) => from_found || to_found,
+            _ => return None,
+        },
+        _ => true,
+    };
+
+    if found {
+        return None;
+    }
+
+    Some(format!("Path not found: {}", display_path))
+}
+
+fn path_exists_at_ref(git: &GitBridge, refspec: &str, rel_path: &str) -> Option<bool> {
+    git.read_file_at_ref(refspec, rel_path)
+        .ok()
+        .map(|content| content.is_some())
+}
+
+fn canonical_relative_path(repo_root: &Path, abs_path: &Path) -> Option<PathBuf> {
+    let canonical_path = abs_path.canonicalize().ok()?;
+    let canonical_root = repo_root.canonicalize().ok()?;
+    canonical_path
+        .strip_prefix(canonical_root)
+        .ok()
+        .map(Path::to_path_buf)
+}
+
+fn normalize_relative_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => match normalized.components().next_back() {
+                Some(std::path::Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(std::path::Component::ParentDir) | None => normalized.push(".."),
+                Some(std::path::Component::RootDir)
+                | Some(std::path::Component::Prefix(_))
+                | Some(std::path::Component::CurDir) => {}
+            },
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                normalized.push(component.as_os_str())
+            }
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normalized
+    }
+}
+
+// Graph entity `file_path`s are forward-slash, so relative paths must be too or lookups miss on Windows.
+fn path_to_slash(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+#[derive(Clone)]
+struct McpLogOccurrence {
+    commit_index: usize,
+    file_path: String,
+    entity: SemanticEntity,
+}
+
+fn mcp_find_seed_occurrence(
+    git: &GitBridge,
+    registry: &ParserRegistry,
+    commits: &[CommitInfo],
+    entity_name: &str,
+    file_path: Option<&str>,
+) -> Option<McpLogOccurrence> {
+    for (index, commit) in commits.iter().enumerate().rev() {
+        let paths = match file_path {
+            Some(path) => vec![path.to_string()],
+            None => git
+                .get_commit_changed_files(&commit.sha)
+                .unwrap_or_default(),
+        };
+        for path in paths {
+            if let Some(entity) =
+                mcp_entity_by_name_at_ref(git, registry, &commit.sha, &path, entity_name)
+            {
+                return Some(McpLogOccurrence {
+                    commit_index: index,
+                    file_path: path,
+                    entity,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn mcp_trace_back_to_origin(
+    git: &GitBridge,
+    registry: &ParserRegistry,
+    commits: &[CommitInfo],
+    seed: McpLogOccurrence,
+) -> Vec<serde_json::Value> {
+    let mut current = seed;
+    let mut entries = Vec::new();
+    for child_index in (1..=current.commit_index).rev() {
+        let child_commit = &commits[child_index];
+        let parent_commit = &commits[child_index - 1];
+        let changed_paths = git
+            .get_commit_changed_files(&child_commit.sha)
+            .unwrap_or_default();
+        let previous = mcp_find_related_entity_at_ref(
+            git,
+            registry,
+            &parent_commit.sha,
+            &current.file_path,
+            &current.entity.name,
+            current.entity.structural_hash.as_deref(),
+            &changed_paths,
+        );
+        let Some(previous) = previous else {
+            entries.push(mcp_added_entry(child_commit, &current));
+            entries.reverse();
+            return entries;
+        };
+        if let Some(entry) = mcp_transition_entry(child_commit, &previous, &current) {
+            entries.push(entry);
+        }
+        current = McpLogOccurrence {
+            commit_index: child_index - 1,
+            ..previous
+        };
+    }
+    entries.push(mcp_added_entry(&commits[current.commit_index], &current));
+    entries.reverse();
+    entries
+}
+
+fn mcp_trace_forward_from_seed(
+    git: &GitBridge,
+    registry: &ParserRegistry,
+    commits: &[CommitInfo],
+    seed: McpLogOccurrence,
+) -> Vec<serde_json::Value> {
+    let mut current = seed;
+    let mut entries = Vec::new();
+    for child_index in current.commit_index + 1..commits.len() {
+        let child_commit = &commits[child_index];
+        let changed_paths = git
+            .get_commit_changed_files(&child_commit.sha)
+            .unwrap_or_default();
+        let next = mcp_find_related_entity_at_ref(
+            git,
+            registry,
+            &child_commit.sha,
+            &current.file_path,
+            &current.entity.name,
+            current.entity.structural_hash.as_deref(),
+            &changed_paths,
+        );
+        let Some(next) = next else {
+            entries.push(mcp_deleted_entry(child_commit, &current));
+            break;
+        };
+        if let Some(entry) = mcp_transition_entry(child_commit, &current, &next) {
+            entries.push(entry);
+        }
+        current = McpLogOccurrence {
+            commit_index: child_index,
+            ..next
+        };
+    }
+    entries
+}
+
+fn mcp_find_related_entity_at_ref(
+    git: &GitBridge,
+    registry: &ParserRegistry,
+    sha: &str,
+    preferred_file: &str,
+    entity_name: &str,
+    structural_hash: Option<&str>,
+    changed_paths: &[String],
+) -> Option<McpLogOccurrence> {
+    let paths = mcp_candidate_paths(preferred_file, changed_paths);
+    for path in &paths {
+        if let Some(entity) = mcp_entity_by_name_at_ref(git, registry, sha, path, entity_name) {
+            return Some(McpLogOccurrence {
+                commit_index: 0,
+                file_path: path.clone(),
+                entity,
+            });
+        }
+    }
+    let structural_hash = structural_hash?;
+    for path in &paths {
+        if let Some(entity) =
+            mcp_entity_by_structural_hash_at_ref(git, registry, sha, path, structural_hash)
+        {
+            return Some(McpLogOccurrence {
+                commit_index: 0,
+                file_path: path.clone(),
+                entity,
+            });
+        }
+    }
+    None
+}
+
+fn mcp_candidate_paths(preferred_file: &str, changed_paths: &[String]) -> Vec<String> {
+    let mut paths = vec![preferred_file.to_string()];
+    for path in changed_paths {
+        if !paths.iter().any(|existing| existing == path) {
+            paths.push(path.clone());
+        }
+    }
+    paths
+}
+
+fn mcp_entity_by_name_at_ref(
+    git: &GitBridge,
+    registry: &ParserRegistry,
+    sha: &str,
+    file_path: &str,
+    entity_name: &str,
+) -> Option<SemanticEntity> {
+    mcp_entities_at_ref(git, registry, sha, file_path)
+        .into_iter()
+        .find(|entity| entity.name == entity_name)
+}
+
+fn mcp_entity_by_structural_hash_at_ref(
+    git: &GitBridge,
+    registry: &ParserRegistry,
+    sha: &str,
+    file_path: &str,
+    structural_hash: &str,
+) -> Option<SemanticEntity> {
+    mcp_entities_at_ref(git, registry, sha, file_path)
+        .into_iter()
+        .find(|entity| entity.structural_hash.as_deref() == Some(structural_hash))
+}
+
+fn mcp_entities_at_ref(
+    git: &GitBridge,
+    registry: &ParserRegistry,
+    sha: &str,
+    file_path: &str,
+) -> Vec<SemanticEntity> {
+    git.read_file_at_ref(sha, file_path)
+        .ok()
+        .flatten()
+        .map(|content| registry.extract_entities(file_path, &content))
+        .unwrap_or_default()
+}
+
+fn mcp_transition_entry(
+    commit: &CommitInfo,
+    before: &McpLogOccurrence,
+    after: &McpLogOccurrence,
+) -> Option<serde_json::Value> {
+    let file_changed = before.file_path != after.file_path;
+    let name_changed = before.entity.name != after.entity.name;
+    let content_changed = before.entity.content_hash != after.entity.content_hash;
+    let change_type = if file_changed {
+        "moved"
+    } else if name_changed {
+        "renamed"
+    } else if content_changed {
+        if mcp_structural_changed(&before.entity, &after.entity) {
+            "modified (logic)"
+        } else {
+            "modified (cosmetic)"
+        }
+    } else {
+        return None;
+    };
+    let mut entry = mcp_base_entry(commit, change_type, Some(&after.file_path));
+    if file_changed {
+        entry["prev_file_path"] = serde_json::Value::String(before.file_path.clone());
+    }
+    Some(entry)
+}
+
+fn mcp_structural_changed(before: &SemanticEntity, after: &SemanticEntity) -> bool {
+    match (&before.structural_hash, &after.structural_hash) {
+        (Some(before), Some(after)) => before != after,
+        _ => true,
+    }
+}
+
+fn mcp_added_entry(commit: &CommitInfo, occurrence: &McpLogOccurrence) -> serde_json::Value {
+    mcp_base_entry(commit, "added", Some(&occurrence.file_path))
+}
+
+fn mcp_deleted_entry(commit: &CommitInfo, occurrence: &McpLogOccurrence) -> serde_json::Value {
+    mcp_base_entry(commit, "deleted", Some(&occurrence.file_path))
+}
+
+fn mcp_base_entry(
+    commit: &CommitInfo,
+    change_type: &str,
+    file_path: Option<&str>,
+) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "commit": commit.sha,
+        "author": commit.author,
+        "date": chrono_lite_format(commit.date.parse::<i64>().unwrap_or(0)),
+        "message": commit.message.lines().next().unwrap_or(""),
+        "change_type": change_type,
+    });
+    if let Some(file_path) = file_path {
+        entry["file_path"] = serde_json::Value::String(file_path.to_string());
+    }
+    entry
 }
 
 /// Simple timestamp formatting without external deps.

@@ -1,12 +1,182 @@
 pub mod blame;
+pub mod cloud;
+pub mod consent;
 pub mod context;
 pub mod diff;
 pub mod entities;
+pub mod files;
 pub mod graph;
+pub mod hook;
 pub mod impact;
 pub mod log;
+pub mod repos;
 pub mod setup;
-pub mod verify;
+pub mod sidecar;
+pub mod stats;
+
+#[cfg(feature = "self-update")]
+pub mod update;
+
+/// When built without the `self-update` feature (e.g. distro/package-manager
+/// builds that own the binary's lifecycle), self-update and the background
+/// update check are disabled. These no-op stubs keep the call sites compiling.
+#[cfg(not(feature = "self-update"))]
+pub mod update {
+    pub fn maybe_notify(_command: &str) {}
+    pub fn background_check() {}
+    pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+        println!(
+            "This build of sem has self-update disabled. Update it through the \
+             package manager it was installed with (e.g. pkgsrc, Homebrew, apt)."
+        );
+        Ok(())
+    }
+}
+
+use sem_core::parser::plugins::create_default_registry;
+use sem_core::parser::registry::ParserRegistry;
+use std::path::{Component, Path, PathBuf};
+
+use sem_core::git::bridge::GitBridge;
+
+/// Create a parser registry with extension mappings loaded from `cwd`.
+/// Loads `.semrc` first (takes priority), then `.gitattributes` as fallback.
+pub fn create_registry(cwd: &str) -> ParserRegistry {
+    let mut registry = create_default_registry();
+    let root = Path::new(cwd);
+    registry.load_semrc(root);
+    registry.load_gitattributes(root);
+    registry
+}
+
+pub fn repo_root_or_cwd(cwd: &str) -> PathBuf {
+    GitBridge::open(Path::new(cwd))
+        .map(|git| git.repo_root().to_path_buf())
+        .unwrap_or_else(|_| Path::new(cwd).to_path_buf())
+}
+
+pub fn normalize_repo_relative_path(cwd: &Path, repo_root: &Path, path: &str) -> String {
+    if path.is_empty() {
+        return ".".to_string();
+    }
+    if path.starts_with(':') {
+        return path.to_string();
+    }
+
+    let path = Path::new(path);
+    let cwd_base = normalize_existing_prefix(cwd).unwrap_or_else(|| normalize_lexical(cwd));
+    let repo_root_base =
+        normalize_existing_prefix(repo_root).unwrap_or_else(|| normalize_lexical(repo_root));
+    let absolute = if path.is_absolute() {
+        normalize_lexical(path)
+    } else {
+        normalize_lexical(&cwd_base.join(path))
+    };
+
+    let repo_root = normalize_lexical(&repo_root_base);
+    let Ok(relative) = absolute.strip_prefix(&repo_root) else {
+        return absolute.to_string_lossy().replace('\\', "/");
+    };
+
+    if relative.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        relative.to_string_lossy().replace('\\', "/")
+    }
+}
+
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    normalized
+}
+
+fn normalize_existing_prefix(path: &Path) -> Option<PathBuf> {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return Some(canonical);
+    }
+
+    let mut missing = Vec::new();
+    let mut current = path;
+
+    while let Some(parent) = current.parent() {
+        if let Some(name) = current.file_name() {
+            missing.push(name.to_os_string());
+        }
+        if let Ok(mut canonical) = std::fs::canonicalize(parent) {
+            for component in missing.iter().rev() {
+                canonical.push(component);
+            }
+            return Some(normalize_lexical(&canonical));
+        }
+        current = parent;
+    }
+
+    None
+}
+
+pub fn entity_matches_query(entity: &sem_core::parser::graph::EntityInfo, query: &str) -> bool {
+    if entity.name == query {
+        return true;
+    }
+
+    let Some((entity_type, name)) = split_type_qualified_query(query) else {
+        return false;
+    };
+
+    entity.entity_type == entity_type && entity.name == name
+}
+
+/// Like `entity_matches_query`, but also resolves `Class.method` (or
+/// `Outer.Inner.method`) addressing: `entity` matches `Parent.child` when its
+/// own name is `child` and its parent entity is named `Parent`. Needs the graph
+/// to look up the parent. Agents reach for `Class.method` naturally, so every
+/// entity-addressing command should accept it.
+pub fn entity_matches_qualified(
+    graph: &sem_core::parser::graph::EntityGraph,
+    entity: &sem_core::parser::graph::EntityInfo,
+    query: &str,
+) -> bool {
+    if entity_matches_query(entity, query) {
+        return true;
+    }
+    // Accept both `Parent.child` and `Parent::child` — agents reach for
+    // whichever qualifier their working language uses.
+    let split = query
+        .rsplit_once("::")
+        .or_else(|| query.rsplit_once('.'));
+    if let Some((parent_part, child_part)) = split {
+        if entity.name == child_part {
+            if let Some(pid) = &entity.parent_id {
+                if let Some(parent) = graph.entities.get(pid) {
+                    return parent.name == parent_part;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn split_type_qualified_query(query: &str) -> Option<(&str, &str)> {
+    let (entity_type, name) = query.split_once(' ')?;
+    if entity_type.is_empty() || name.is_empty() {
+        return None;
+    }
+
+    Some((entity_type, name))
+}
 
 /// Truncate a string to `max_chars` Unicode scalar values (codepoints), appending "..." if
 /// truncated. Safe for multibyte encodings (CJK, simple emoji). Note: does not split on grapheme
@@ -45,7 +215,40 @@ pub fn truncate_str(s: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_str;
+    use super::{
+        entity_matches_query, normalize_existing_prefix, normalize_lexical,
+        normalize_repo_relative_path, truncate_str,
+    };
+    use sem_core::parser::graph::EntityInfo;
+    use std::path::Path;
+
+    fn entity(entity_type: &str, name: &str) -> EntityInfo {
+        EntityInfo {
+            id: format!("a.ts::{entity_type}::{name}"),
+            name: name.to_string(),
+            entity_type: entity_type.to_string(),
+            file_path: "a.ts".to_string(),
+            parent_id: None,
+            start_line: 1,
+            end_line: 1,
+        }
+    }
+
+    #[test]
+    fn entity_query_matches_exact_name() {
+        let entity = entity("function", "getter value");
+
+        assert!(entity_matches_query(&entity, "getter value"));
+    }
+
+    #[test]
+    fn entity_query_matches_type_qualified_name() {
+        let entity = entity("getter", "value");
+
+        assert!(entity_matches_query(&entity, "getter value"));
+        assert!(!entity_matches_query(&entity, "setter value"));
+        assert!(!entity_matches_query(&entity, "method value"));
+    }
 
     #[test]
     fn ascii_short_string_unchanged() {
@@ -124,5 +327,139 @@ mod tests {
     fn max_chars_four_triggers_ellipsis() {
         // max_chars == 4, string is longer → take 1 char + "..."
         assert_eq!(truncate_str("hello", 4), "h...");
+    }
+
+    #[test]
+    fn normalize_repo_relative_path_handles_absolute_paths() {
+        let cwd = Path::new("/repo/sub");
+        let repo_root = Path::new("/repo");
+
+        let normalized = normalize_repo_relative_path(cwd, repo_root, "/repo/sub/foo.py");
+
+        assert_eq!(normalized, "sub/foo.py");
+    }
+
+    #[test]
+    fn normalize_repo_relative_path_handles_parent_components() {
+        let cwd = Path::new("/repo/sub/nested");
+        let repo_root = Path::new("/repo");
+
+        let normalized = normalize_repo_relative_path(cwd, repo_root, "../foo.py");
+
+        assert_eq!(normalized, "sub/foo.py");
+    }
+
+    #[test]
+    fn normalize_repo_relative_path_keeps_repo_root_dot_as_all_paths() {
+        let cwd = Path::new("/repo");
+        let repo_root = Path::new("/repo");
+
+        let normalized = normalize_repo_relative_path(cwd, repo_root, ".");
+
+        assert_eq!(normalized, ".");
+    }
+
+    #[test]
+    fn normalize_repo_relative_path_treats_empty_path_as_dot() {
+        let cwd = Path::new("/repo/sub");
+        let repo_root = Path::new("/repo");
+
+        let normalized = normalize_repo_relative_path(cwd, repo_root, "");
+
+        assert_eq!(normalized, ".");
+    }
+
+    #[test]
+    fn normalize_repo_relative_path_converts_subdir_dot_to_subdir() {
+        let cwd = Path::new("/repo/sub");
+        let repo_root = Path::new("/repo");
+
+        let normalized = normalize_repo_relative_path(cwd, repo_root, ".");
+
+        assert_eq!(normalized, "sub");
+    }
+
+    #[test]
+    fn normalize_repo_relative_path_leaves_magic_pathspecs_unchanged() {
+        let cwd = Path::new("/repo/sub");
+        let repo_root = Path::new("/repo");
+
+        let normalized = normalize_repo_relative_path(cwd, repo_root, ":(glob)**/*.py");
+
+        assert_eq!(normalized, ":(glob)**/*.py");
+    }
+
+    #[test]
+    fn normalize_repo_relative_path_returns_normalized_absolute_path_outside_repo() {
+        use std::fs;
+
+        let repo_root =
+            std::env::temp_dir().join(format!("sem-normalize-outside-test-{}", std::process::id()));
+        let cwd = repo_root.join("sub");
+        fs::create_dir_all(&cwd).expect("create cwd");
+        let outside_path = cwd.join("../../outside.py");
+        let expected = normalize_existing_prefix(&outside_path)
+            .unwrap_or_else(|| normalize_lexical(&outside_path))
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        let normalized = normalize_repo_relative_path(&cwd, &repo_root, "../../outside.py");
+
+        assert_eq!(normalized, expected);
+        fs::remove_dir_all(repo_root).expect("remove temp dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_repo_relative_path_handles_symlinked_cwd() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!(
+            "sem-normalize-repo-relative-test-{}-{id}",
+            std::process::id()
+        ));
+        let repo_root = temp.join("repo");
+        let real_subdir = repo_root.join("sub");
+        let symlinked_cwd = temp.join("linked-sub");
+        fs::create_dir_all(&real_subdir).expect("create real cwd");
+        symlink(&real_subdir, &symlinked_cwd).expect("create symlinked cwd");
+
+        let normalized = normalize_repo_relative_path(&symlinked_cwd, &repo_root, "foo.py");
+
+        assert_eq!(normalized, "sub/foo.py");
+        fs::remove_dir_all(temp).expect("remove temp dir");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_repo_relative_path_resolves_missing_cwd_through_symlinked_repo_root() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!(
+            "sem-normalize-missing-cwd-test-{}-{id}",
+            std::process::id()
+        ));
+        let repo_root = temp.join("repo");
+        let symlinked_repo_root = temp.join("linked-repo");
+        fs::create_dir_all(&repo_root).expect("create repo root");
+        symlink(&repo_root, &symlinked_repo_root).expect("create symlinked repo root");
+        let missing_cwd = symlinked_repo_root.join("missing");
+
+        let normalized = normalize_repo_relative_path(&missing_cwd, &repo_root, "foo.py");
+
+        assert_eq!(normalized, "missing/foo.py");
+        fs::remove_dir_all(temp).expect("remove temp dir");
     }
 }

@@ -1,6 +1,7 @@
 {
   "name": "@ataraxy-labs/sem",
-  "version": "0.3.22",
+  "mcpName": "io.github.Ataraxy-Labs/sem",
+  "version": "0.16.2",
   "description": "npm wrapper for the sem CLI. Downloads the matching release binary and exposes the sem command in node_modules/.bin.",
   "license": "MIT OR Apache-2.0",
   "type": "module",
@@ -14,6 +15,7 @@
     "scripts/verify-checksum.mjs",
     "scripts/sync-package-version.mjs",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE-APACHE",
     "LICENSE-MIT"
   ],
@@ -42,6 +44,6 @@
   "scripts": {
     "postinstall": "node ./scripts/postinstall.mjs",
     "prepack": "node ./scripts/sync-package-version.mjs",
-    "test": "node ./scripts/package-meta.test.mjs"
+    "test": "node --test"
   }
 }

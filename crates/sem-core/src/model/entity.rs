@@ -19,6 +19,17 @@ pub struct SemanticEntity {
     pub structural_hash: Option<String>,
     pub start_line: usize,
     pub end_line: usize,
+    /// Byte offset of the entity's first byte in the source file (inclusive).
+    /// `None` for entities from parsers that don't expose byte spans (most
+    /// non-tree-sitter plugins). Set for code entities, where it equals the
+    /// underlying tree-sitter node's `start_byte()`. Lets a consumer slice the
+    /// exact original bytes out of the file given only `file_path` + this span.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_byte: Option<usize>,
+    /// Byte offset just past the entity's last byte in the source file
+    /// (exclusive), matching tree-sitter's `end_byte()`. `None` when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_byte: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, String>>,
 }
@@ -30,9 +41,34 @@ pub fn build_entity_id(
     parent_id: Option<&str>,
 ) -> String {
     match parent_id {
-        Some(pid) => format!("{file_path}::{pid}::{name}"),
+        Some(pid) => format!("{pid}::{name}"),
         None => format!("{file_path}::{entity_type}::{name}"),
     }
+}
+
+/// Build an entity ID with a line-number disambiguator for overloads.
+pub fn build_entity_id_disambiguated(
+    file_path: &str,
+    entity_type: &str,
+    name: &str,
+    parent_id: Option<&str>,
+    line: usize,
+) -> String {
+    let base = build_entity_id(file_path, entity_type, name, parent_id);
+    format!("{base}@L{line}")
+}
+
+/// Build an entity ID with a line-number and same-line ordinal disambiguator.
+pub fn build_entity_id_disambiguated_with_ordinal(
+    file_path: &str,
+    entity_type: &str,
+    name: &str,
+    parent_id: Option<&str>,
+    line: usize,
+    ordinal: usize,
+) -> String {
+    let base = build_entity_id_disambiguated(file_path, entity_type, name, parent_id, line);
+    format!("{base}#{ordinal}")
 }
 
 #[cfg(test)]
@@ -49,7 +85,12 @@ mod tests {
 
     #[test]
     fn test_build_entity_id_with_parent() {
-        let id = build_entity_id("src/main.ts", "method", "greet", Some("MyClass"));
-        assert_eq!(id, "src/main.ts::MyClass::greet");
+        let id = build_entity_id(
+            "src/main.ts",
+            "method",
+            "greet",
+            Some("src/main.ts::class::MyClass"),
+        );
+        assert_eq!(id, "src/main.ts::class::MyClass::greet");
     }
 }

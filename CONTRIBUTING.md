@@ -1,5 +1,21 @@
 # Contributing to sem
 
+## Changelog Entries
+
+Every pull request should add a `CHANGELOG.md` entry under `## [Unreleased]`.
+Use the section that best describes the change:
+
+- `Added`
+- `Changed`
+- `Fixed`
+- `Removed`
+- `Security`
+- `Maintenance`
+
+Keep entries concise and user-facing. For maintenance-only work, add a short
+`Maintenance` bullet. CI checks that each pull request adds at least one line to
+`CHANGELOG.md`.
+
 ## Adding a New Language
 
 sem uses [tree-sitter](https://tree-sitter.github.io/tree-sitter/) grammars to extract semantic entities (functions, classes, etc.) from source code. Adding a new language is straightforward: you define a config struct and add a cargo dependency. No parser code needed.
@@ -216,3 +232,7 @@ This prints the full AST with node types.
 ## Questions?
 
 Open an issue or check the existing language configs in `languages.rs` for reference. The simplest configs (Python, Bash) are good starting points. The Elixir config shows the call-based approach.
+
+## Performance Fixtures
+
+For graph-build performance work, use the generated JS/TS fixture benchmark in `benchmarks/large-js-fixture/`. It can regenerate large public fixtures and measure cold cache, warm cache, and one-file incremental rebuild timings without relying on private repositories.
