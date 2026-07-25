@@ -850,17 +850,11 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  Structural surface — Added/Deleted containers should NOT be suppressed
-    //  because they represent a genuinely new/removed part of the tree, which
-    //  the leaf changes alone don't fully explain.
+    //  Structural surface — Added/Deleted containers are reported
     // ─────────────────────────────────────────────────────────────────────────
 
     #[test]
     fn whole_new_container_surfaces_as_added() {
-        // Adding a whole new object should report both the container and its
-        // leaves. The container change carries the structural "this branch is
-        // new" signal that leaves alone can't convey to consumers who care
-        // about layout (e.g. a file-diff view).
         let changes = json_diff(
             "{}",
             "{\n  \"defaults\": {\n    \"retries\": 3\n  }\n}",
@@ -881,9 +875,6 @@ mod tests {
 
     #[test]
     fn deep_whole_section_deleted_surfaces_every_intermediate_container() {
-        // Deleting a whole nested branch surfaces the leaf AND every
-        // intermediate container on the way down, so consumers can render
-        // the full structural removal (not just the leaf).
         let changes = json_diff(
             "{\n  \"jest\": {\n    \"config\": {\n      \"testTimeout\": 5000\n    }\n  }\n}",
             "{}",
@@ -896,10 +887,8 @@ mod tests {
 
     #[test]
     fn parent_rename_with_sibling_added_surfaces_container_swap_plus_moves() {
-        // Parent rename can't be detected directly (the new sibling changes
-        // the parent's structural_hash), so it surfaces as one container
-        // Deleted plus one container Added — which is the honest structural
-        // story anyway. The unchanged child moves between them.
+        // Sem can't detect the parent rename (the new sibling perturbs the
+        // parent's structural_hash), so it surfaces as Deleted + Added.
         let before = r#"{
   "scripts": {
     "build": "tsc"
@@ -922,9 +911,6 @@ mod tests {
 
     #[test]
     fn new_container_around_moved_child_surfaces_as_added() {
-        // Move `retries` into a brand-new `defaults` container. The move
-        // captures the child; the container is structurally new and must
-        // surface on top so consumers know the tree gained a branch.
         let before = r#"{
   "monitoring": {
     "retries": 3
@@ -1045,13 +1031,8 @@ mod tests {
 
     #[test]
     fn parent_object_renamed_and_child_renamed_surfaces_move_plus_structural_add() {
-        // scripts → tasks AND dev → develop. Parent rename cannot be detected
-        // (the renamed child changes the parent's structural_hash), so the
-        // parent surfaces as a plain Added container and the child as Moved,
-        // carrying:
-        //   parent_name="tasks", old_entity_name="dev", old_parent_id=<scripts>
-        // Consumers see: "there's a new `tasks` branch, and `develop` (was
-        // `dev`) is inside it, previously under `scripts`."
+        // Parent rename undetectable (renamed child perturbs structural_hash),
+        // so the parent surfaces as Added and the child as Moved.
         let before = "{\n  \"scripts\": {\n    \"dev\": \"vite\"\n  }\n}\n";
         let after = "{\n  \"tasks\": {\n    \"develop\": \"vite\"\n  }\n}\n";
         let changes = json_diff(before, after);
@@ -1059,10 +1040,7 @@ mod tests {
         let develop = find_change(&changes, "develop", ChangeType::Moved);
         assert_eq!(develop.old_entity_name.as_deref(), Some("dev"));
         assert_eq!(develop.parent_name.as_deref(), Some("tasks"));
-        assert!(
-            develop.old_parent_id.is_some(),
-            "child Moved should carry old_parent_id"
-        );
+        assert!(develop.old_parent_id.is_some());
     }
 
     // ─────────────────────────────────────────────────────────────────────────

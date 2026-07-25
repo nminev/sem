@@ -2023,8 +2023,6 @@ function hello() {}
                 .collect::<Vec<_>>()
         );
 
-        // script parent surfaces as Added — it's a structural new container,
-        // its children Added independently describe the contents.
         assert!(
             result
                 .changes

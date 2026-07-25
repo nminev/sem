@@ -304,15 +304,9 @@ fn suppress_redundant_parents(
             continue;
         }
 
-        // Modified container: suppress only if the container's own declaration
-        // is unchanged and the value type didn't transition — the children
-        // carry the useful detail and reporting the parent would be noise.
-        //
-        // Added/Deleted container: DO NOT suppress. The container's existence
-        // (or absence) is a structural fact the children can't fully convey —
-        // a new nested branch has no explicit representation in leaf-only
-        // change lists. Consumers rendering file-level diffs need this to
-        // align the surrounding braces.
+        // Modified container: suppress only when its own declaration is
+        // unchanged and the value type didn't transition. Added/Deleted
+        // container: the container itself is the change worth reporting.
         let should_suppress = if change.change_type == ChangeType::Modified {
             match (before_by_id.get(eid), after_by_id.get(eid)) {
                 (Some(bp), Some(ap)) if bp.entity_type == ap.entity_type => {
@@ -331,12 +325,9 @@ fn suppress_redundant_parents(
         }
     }
 
-    // If a Moved child's old parent is itself reported as Modified, that
-    // parent Modified is noise — the move's `old_parent_id` already conveys
-    // "the child left this parent". Suppress only that noisy Modified case.
-    // Do NOT suppress Added/Deleted on the old parent: those describe a real
-    // structural swap (parent renamed / whole container replaced) that
-    // consumers need to see alongside the child's move.
+    // A Moved child's `old_parent_id` already conveys "left this parent",
+    // so a Modified entry on that parent is redundant. Added/Deleted on it
+    // is a real structural swap and stays.
     let modified_ids: HashSet<&str> = changes
         .iter()
         .filter(|c| c.change_type == ChangeType::Modified)
