@@ -76,3 +76,9 @@ aws lambda update-function-code \
 ## How it works
 
 Multi-stage Docker build: stage 1 compiles `sem-cli` from this repo's `crates/` directory inside Amazon Linux 2023, stage 2 copies the binary into the Lambda Python runtime. No git repo needed at runtime — `sem diff --stdin` accepts file changes directly as JSON.
+
+## Browser viewer
+
+A static HTML page that calls this Lambda and visualizes the response
+(semantic changes + GitHub-style file diff) lives at
+[`nminev/sem-diff-viewer`](https://github.com/nminev/sem-diff-viewer).
