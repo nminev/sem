@@ -2023,13 +2023,14 @@ function hello() {}
                 .collect::<Vec<_>>()
         );
 
-        // script parent is suppressed because its child (count) is also Added
+        // script parent surfaces as Added — it's a structural new container,
+        // its children Added independently describe the contents.
         assert!(
-            !result
+            result
                 .changes
                 .iter()
                 .any(|c| c.entity_name == "script" && c.entity_type == "svelte_instance_script"),
-            "script parent should be suppressed when children are also added"
+            "script parent should surface as Added alongside its children"
         );
         assert!(
             result

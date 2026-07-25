@@ -23,7 +23,12 @@ WORKDIR /sem/crates
 RUN cargo chef cook --release --recipe-path recipe.json
 
 # Stage 1d: copy real source, rebuild only our crates against the cached deps.
+# WORKDIR is reset to /sem so `COPY crates ./crates` lands at /sem/crates,
+# overwriting the placeholder Cargo.toml scaffolding cargo-chef left there
+# during the cook stage. Without this reset, source ended up at
+# /sem/crates/crates and cargo built a 400 KB stub.
 FROM deps AS builder
+WORKDIR /sem
 COPY crates ./crates
 WORKDIR /sem/crates
 RUN cargo build --release -p sem-cli

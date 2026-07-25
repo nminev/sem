@@ -304,9 +304,15 @@ fn suppress_redundant_parents(
             continue;
         }
 
-        // Added/Deleted: suppress unconditionally; the children carry the detail.
-        // Modified: only suppress if the container's own declaration is unchanged
-        // and the value type didn't transition.
+        // Modified container: suppress only if the container's own declaration
+        // is unchanged and the value type didn't transition — the children
+        // carry the useful detail and reporting the parent would be noise.
+        //
+        // Added/Deleted container: DO NOT suppress. The container's existence
+        // (or absence) is a structural fact the children can't fully convey —
+        // a new nested branch has no explicit representation in leaf-only
+        // change lists. Consumers rendering file-level diffs need this to
+        // align the surrounding braces.
         let should_suppress = if change.change_type == ChangeType::Modified {
             match (before_by_id.get(eid), after_by_id.get(eid)) {
                 (Some(bp), Some(ap)) if bp.entity_type == ap.entity_type => {
@@ -317,7 +323,7 @@ fn suppress_redundant_parents(
                 _ => false,
             }
         } else {
-            true
+            false
         };
 
         if should_suppress {
@@ -325,13 +331,21 @@ fn suppress_redundant_parents(
         }
     }
 
-    // Suppress an old parent that a Moved child left behind when the old
-    // parent itself appears as a change — handles the parent-rename case
-    // where the parent itself failed to match.
+    // If a Moved child's old parent is itself reported as Modified, that
+    // parent Modified is noise — the move's `old_parent_id` already conveys
+    // "the child left this parent". Suppress only that noisy Modified case.
+    // Do NOT suppress Added/Deleted on the old parent: those describe a real
+    // structural swap (parent renamed / whole container replaced) that
+    // consumers need to see alongside the child's move.
+    let modified_ids: HashSet<&str> = changes
+        .iter()
+        .filter(|c| c.change_type == ChangeType::Modified)
+        .map(|c| c.entity_id.as_str())
+        .collect();
     for change in changes.iter() {
         if change.change_type == ChangeType::Moved {
             if let Some(ref old_pid) = change.old_parent_id {
-                if changed_ids.contains(old_pid.as_str()) {
+                if modified_ids.contains(old_pid.as_str()) {
                     suppress.insert(old_pid.clone());
                 }
             }
