@@ -23,7 +23,10 @@ WORKDIR /sem/crates
 RUN cargo chef cook --release --recipe-path recipe.json
 
 # Stage 1d: copy real source, rebuild only our crates against the cached deps.
+# WORKDIR reset is load-bearing: without it, COPY lands source under
+# /sem/crates/crates and cargo builds cargo-chef's placeholder root instead.
 FROM deps AS builder
+WORKDIR /sem
 COPY crates ./crates
 WORKDIR /sem/crates
 RUN cargo build --release -p sem-cli

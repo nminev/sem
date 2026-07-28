@@ -849,27 +849,82 @@ mod tests {
         assert_eq!(test.parent_name.as_deref(), Some("scripts"));
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Structural surface — Added/Deleted containers are reported
+    // ─────────────────────────────────────────────────────────────────────────
+
     #[test]
-    fn whole_object_added_only_leaf_children_reported() {
-        let changes = json_diff("{}", "{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}");
-        assert!(
-            !changes.iter().any(|c| c.entity_name == "scripts"),
-            "scripts (container) should be suppressed; got: {:?}",
-            names(&changes)
+    fn whole_new_container_surfaces_as_added() {
+        let changes = json_diff(
+            "{}",
+            "{\n  \"defaults\": {\n    \"retries\": 3\n  }\n}",
         );
-        let build = find_change(&changes, "build", ChangeType::Added);
-        assert_eq!(build.parent_name.as_deref(), Some("scripts"));
+        find_change(&changes, "defaults", ChangeType::Added);
+        find_change(&changes, "retries", ChangeType::Added);
     }
 
     #[test]
-    fn whole_object_deleted_only_leaf_children_reported() {
-        let changes = json_diff("{\n  \"scripts\": {\n    \"build\": \"tsc\"\n  }\n}", "{}");
-        assert!(
-            !changes.iter().any(|c| c.entity_name == "scripts"),
-            "scripts (container) should be suppressed; got: {:?}",
-            names(&changes)
+    fn whole_deleted_container_surfaces_as_deleted() {
+        let changes = json_diff(
+            "{\n  \"defaults\": {\n    \"retries\": 3\n  }\n}",
+            "{}",
         );
-        find_change(&changes, "build", ChangeType::Deleted);
+        find_change(&changes, "defaults", ChangeType::Deleted);
+        find_change(&changes, "retries", ChangeType::Deleted);
+    }
+
+    #[test]
+    fn deep_whole_section_deleted_surfaces_every_intermediate_container() {
+        let changes = json_diff(
+            "{\n  \"jest\": {\n    \"config\": {\n      \"testTimeout\": 5000\n    }\n  }\n}",
+            "{}",
+        );
+        find_change(&changes, "jest", ChangeType::Deleted);
+        find_change(&changes, "config", ChangeType::Deleted);
+        let timeout = find_change(&changes, "testTimeout", ChangeType::Deleted);
+        assert_eq!(timeout.parent_name.as_deref(), Some("jest::config"));
+    }
+
+    #[test]
+    fn parent_rename_with_sibling_added_surfaces_container_swap_plus_moves() {
+        // Sem can't detect the parent rename (the new sibling perturbs the
+        // parent's structural_hash), so it surfaces as Deleted + Added.
+        let before = r#"{
+  "scripts": {
+    "build": "tsc"
+  }
+}"#;
+        let after = r#"{
+  "tasks": {
+    "build": "tsc",
+    "test": "jest"
+  }
+}"#;
+        let changes = json_diff(before, after);
+        find_change(&changes, "scripts", ChangeType::Deleted);
+        find_change(&changes, "tasks", ChangeType::Added);
+        let build = find_change(&changes, "build", ChangeType::Moved);
+        assert_eq!(build.parent_name.as_deref(), Some("tasks"));
+        assert!(build.old_parent_id.is_some());
+        find_change(&changes, "test", ChangeType::Added);
+    }
+
+    #[test]
+    fn new_container_around_moved_child_surfaces_as_added() {
+        let before = r#"{
+  "monitoring": {
+    "retries": 3
+  }
+}"#;
+        let after = r#"{
+  "defaults": {
+    "retries": 3
+  },
+  "monitoring": {}
+}"#;
+        let changes = json_diff(before, after);
+        find_change(&changes, "retries", ChangeType::Moved);
+        find_change(&changes, "defaults", ChangeType::Added);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -975,22 +1030,17 @@ mod tests {
     }
 
     #[test]
-    fn parent_object_renamed_and_child_renamed_only_child_surfaces() {
-        // scripts → tasks AND dev → develop. Parent rename cannot be detected
-        // because the renamed child key changes the parent's structural_hash.
-        // The child move alone conveys the move + rename via:
-        //   parent_name="tasks", old_entity_name="dev", old_parent_id=<scripts>
+    fn parent_object_renamed_and_child_renamed_surfaces_move_plus_structural_add() {
+        // Parent rename undetectable (renamed child perturbs structural_hash),
+        // so the parent surfaces as Added and the child as Moved.
         let before = "{\n  \"scripts\": {\n    \"dev\": \"vite\"\n  }\n}\n";
         let after = "{\n  \"tasks\": {\n    \"develop\": \"vite\"\n  }\n}\n";
         let changes = json_diff(before, after);
-        assert_eq!(names(&changes), vec![("develop".into(), ChangeType::Moved)]);
-        let develop = &changes[0];
+        find_change(&changes, "tasks", ChangeType::Added);
+        let develop = find_change(&changes, "develop", ChangeType::Moved);
         assert_eq!(develop.old_entity_name.as_deref(), Some("dev"));
         assert_eq!(develop.parent_name.as_deref(), Some("tasks"));
-        assert!(
-            develop.old_parent_id.is_some(),
-            "child Moved should carry old_parent_id"
-        );
+        assert!(develop.old_parent_id.is_some());
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1291,37 +1341,6 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn parent_rename_with_sibling_added_surfaces_leaf_moves() {
-        // Parent renamed AND a new sibling appears: structural_hash diverges,
-        // Phase 2 misses the parent rename. The unchanged child still matches
-        // by structural_hash and surfaces as Moved; the parent Deleted/Added
-        // entries are container-suppressed.
-        let before = r#"{
-  "scripts": {
-    "build": "tsc"
-  }
-}"#;
-        let after = r#"{
-  "tasks": {
-    "build": "tsc",
-    "test": "jest"
-  }
-}"#;
-        let changes = json_diff(before, after);
-        let build = find_change(&changes, "build", ChangeType::Moved);
-        assert_eq!(build.parent_name.as_deref(), Some("tasks"));
-        assert!(build.old_parent_id.is_some());
-        find_change(&changes, "test", ChangeType::Added);
-        assert!(
-            !changes
-                .iter()
-                .any(|c| c.entity_name == "scripts" || c.entity_name == "tasks"),
-            "parent Deleted/Added should be suppressed; got: {:?}",
-            names(&changes)
-        );
-    }
-
-    #[test]
     fn scalar_array_transitions_report_modified_only() {
         // Arrays are opaque, so the type transition surfaces as a single
         // Modified entry with entity_type reflecting the after value.
@@ -1365,23 +1384,6 @@ mod tests {
         assert_eq!(deps.entity_type, "object");
         let react = find_change(&changes, "react", ChangeType::Added);
         assert_eq!(react.parent_name.as_deref(), Some("deps"));
-    }
-
-    #[test]
-    fn deep_whole_section_deleted_only_leaf_reported() {
-        let changes = json_diff(
-            "{\n  \"jest\": {\n    \"config\": {\n      \"testTimeout\": 5000\n    }\n  }\n}",
-            "{}",
-        );
-        let timeout = find_change(&changes, "testTimeout", ChangeType::Deleted);
-        assert_eq!(timeout.parent_name.as_deref(), Some("jest::config"));
-        assert!(
-            !changes
-                .iter()
-                .any(|c| c.entity_name == "jest" || c.entity_name == "config"),
-            "intermediate containers should be suppressed; got: {:?}",
-            names(&changes)
-        );
     }
 
     #[test]
