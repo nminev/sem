@@ -14,6 +14,8 @@ use sem_core::utils::scan::is_default_excluded;
 use sem_mcp::cache as shared_cache;
 use serde::Serialize;
 
+use crate::impact_model::{ImpactQueryError, ImpactReport};
+
 const CACHED_TEST_IMPACT_LIMIT: usize = 10_000;
 const SQL_PARAM_CHUNK: usize = 500;
 
@@ -194,15 +196,6 @@ pub enum CachedImpactMode {
     Tests,
 }
 
-pub struct CachedImpactResult {
-    pub entity: EntityInfo,
-    pub dependencies: Vec<EntityInfo>,
-    pub dependents: Vec<EntityInfo>,
-    pub impact: Vec<(EntityInfo, usize)>,
-    pub tests: Vec<EntityInfo>,
-    pub tests_truncated: bool,
-}
-
 #[derive(Serialize)]
 struct EntityListingJsonRow<'a> {
     name: &'a str,
@@ -213,22 +206,6 @@ struct EntityListingJsonRow<'a> {
     parent_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     file: Option<&'a str>,
-}
-
-#[derive(Debug)]
-pub enum CachedImpactError {
-    CacheReadFailed,
-    MissingEntityQuery,
-    EntityIdNotFound(String),
-    EntityNotFound(String),
-    EntityNotFoundInFile {
-        name: String,
-        file: String,
-    },
-    AmbiguousEntity {
-        name: String,
-        matches: Vec<EntityInfo>,
-    },
 }
 
 impl DiskCache {
@@ -578,7 +555,7 @@ impl DiskCache {
         file_hint: Option<&str>,
         mode: CachedImpactMode,
         depth: usize,
-    ) -> Result<Option<CachedImpactResult>, CachedImpactError> {
+    ) -> Result<Option<ImpactReport>, ImpactQueryError> {
         if !shared_cache::cache_has_kind(
             &self.conn,
             &[
@@ -626,12 +603,12 @@ impl DiskCache {
         file_hint: Option<&str>,
         mode: CachedImpactMode,
         depth: usize,
-    ) -> Result<Option<CachedImpactResult>, CachedImpactError> {
+    ) -> Result<Option<ImpactReport>, ImpactQueryError> {
         let entity = self.find_cached_impact_entity(entity_name, entity_id, file_hint)?;
         let dependencies = if matches!(mode, CachedImpactMode::All | CachedImpactMode::Deps) {
             match self.direct_dependencies(&entity.id) {
                 Ok(dependencies) => dependencies,
-                Err(_) => return Err(CachedImpactError::CacheReadFailed),
+                Err(_) => return Err(ImpactQueryError::CacheReadFailed),
             }
         } else {
             Vec::new()
@@ -639,7 +616,7 @@ impl DiskCache {
         let impact = if matches!(mode, CachedImpactMode::All) {
             match self.impact_entities(&entity.id, depth, None) {
                 Ok(impact) => impact,
-                Err(_) => return Err(CachedImpactError::CacheReadFailed),
+                Err(_) => return Err(ImpactQueryError::CacheReadFailed),
             }
         } else {
             Vec::new()
@@ -653,7 +630,7 @@ impl DiskCache {
         } else if matches!(mode, CachedImpactMode::Dependents) {
             match self.direct_dependents(&entity.id) {
                 Ok(dependents) => dependents,
-                Err(_) => return Err(CachedImpactError::CacheReadFailed),
+                Err(_) => return Err(ImpactQueryError::CacheReadFailed),
             }
         } else {
             Vec::new()
@@ -662,19 +639,20 @@ impl DiskCache {
             if matches!(mode, CachedImpactMode::All | CachedImpactMode::Tests) {
                 match self.test_impact_entities(&entity.id) {
                     Ok(tests) => tests,
-                    Err(_) => return Err(CachedImpactError::CacheReadFailed),
+                    Err(_) => return Err(ImpactQueryError::CacheReadFailed),
                 }
             } else {
                 (Vec::new(), false)
             };
 
-        Ok(Some(CachedImpactResult {
+        Ok(Some(ImpactReport {
             entity,
             dependencies,
             dependents,
             impact,
             tests,
             tests_truncated,
+            test_evidence: Default::default(),
         }))
     }
 
@@ -687,7 +665,7 @@ impl DiskCache {
         entity_name: Option<&str>,
         entity_id: Option<&str>,
         file_hint: Option<&str>,
-    ) -> Result<Option<CachedImpactResult>, CachedImpactError> {
+    ) -> Result<Option<ImpactReport>, ImpactQueryError> {
         if shared_cache::is_manifest_stale(&self.conn, root) {
             return Ok(None);
         }
@@ -702,26 +680,27 @@ impl DiskCache {
 
         let entity = match self.find_cached_impact_entity(entity_name, entity_id, file_hint) {
             Ok(entity) => entity,
-            Err(CachedImpactError::CacheReadFailed) => {
-                return Err(CachedImpactError::CacheReadFailed);
+            Err(ImpactQueryError::CacheReadFailed) => {
+                return Err(ImpactQueryError::CacheReadFailed);
             }
             Err(_) => return Ok(None),
         };
         let dependencies = self
             .direct_dependencies(&entity.id)
-            .map_err(|_| CachedImpactError::CacheReadFailed)?;
+            .map_err(|_| ImpactQueryError::CacheReadFailed)?;
 
         if cache_first && !self.has_fresh_dependency_impact_files(root, &entity, &dependencies)? {
             return Ok(None);
         }
 
-        Ok(Some(CachedImpactResult {
+        Ok(Some(ImpactReport {
             entity,
             dependencies,
             dependents: Vec::new(),
             impact: Vec::new(),
             tests: Vec::new(),
             tests_truncated: false,
+            test_evidence: Default::default(),
         }))
     }
 
@@ -730,10 +709,10 @@ impl DiskCache {
         root: &Path,
         entity: &EntityInfo,
         dependencies: &[EntityInfo],
-    ) -> Result<bool, CachedImpactError> {
+    ) -> Result<bool, ImpactQueryError> {
         if !self
             .cached_files_are_fresh(root, HashSet::from([entity.file_path.clone()]))
-            .map_err(|_| CachedImpactError::CacheReadFailed)?
+            .map_err(|_| ImpactQueryError::CacheReadFailed)?
         {
             return Ok(false);
         }
@@ -744,7 +723,7 @@ impl DiskCache {
         }
         let cached_imported_files = self
             .cached_imported_files(&entity.file_path)
-            .map_err(|_| CachedImpactError::CacheReadFailed)?;
+            .map_err(|_| ImpactQueryError::CacheReadFailed)?;
         let Some(current_imports) = current_imported_files(root, &entity.file_path)? else {
             return Ok(false);
         };
@@ -762,7 +741,7 @@ impl DiskCache {
         }
 
         self.cached_files_are_fresh(root, required_files)
-            .map_err(|_| CachedImpactError::CacheReadFailed)
+            .map_err(|_| ImpactQueryError::CacheReadFailed)
     }
 
     fn cached_imported_files(&self, file_path: &str) -> Result<HashSet<String>, rusqlite::Error> {
@@ -990,33 +969,33 @@ impl DiskCache {
         entity_name: Option<&str>,
         entity_id: Option<&str>,
         file_hint: Option<&str>,
-    ) -> Result<EntityInfo, CachedImpactError> {
+    ) -> Result<EntityInfo, ImpactQueryError> {
         if let Some(id) = entity_id {
             return self
                 .entity_by_id(id)
-                .map_err(|_| CachedImpactError::CacheReadFailed)?
-                .ok_or_else(|| CachedImpactError::EntityIdNotFound(id.to_string()));
+                .map_err(|_| ImpactQueryError::CacheReadFailed)?
+                .ok_or_else(|| ImpactQueryError::EntityIdNotFound(id.to_string()));
         }
 
-        let name = entity_name.ok_or(CachedImpactError::MissingEntityQuery)?;
+        let name = entity_name.ok_or(ImpactQueryError::MissingEntityQuery)?;
         let mut matching = self
             .entity_candidates_for_query(name, file_hint)
-            .map_err(|_| CachedImpactError::CacheReadFailed)?;
+            .map_err(|_| ImpactQueryError::CacheReadFailed)?;
 
         if matching.is_empty() {
             if let Some(file) = file_hint {
                 let global_matches = self
                     .entity_candidates_for_query(name, None)
-                    .map_err(|_| CachedImpactError::CacheReadFailed)?;
+                    .map_err(|_| ImpactQueryError::CacheReadFailed)?;
                 if global_matches.is_empty() {
-                    return Err(CachedImpactError::EntityNotFound(name.to_string()));
+                    return Err(ImpactQueryError::EntityNotFound(name.to_string()));
                 }
-                return Err(CachedImpactError::EntityNotFoundInFile {
+                return Err(ImpactQueryError::EntityNotFoundInFile {
                     name: name.to_string(),
                     file: file.to_string(),
                 });
             }
-            return Err(CachedImpactError::EntityNotFound(name.to_string()));
+            return Err(ImpactQueryError::EntityNotFound(name.to_string()));
         }
 
         if matching.len() == 1 {
@@ -1030,7 +1009,7 @@ impl DiskCache {
                 entity.id.clone(),
             )
         });
-        Err(CachedImpactError::AmbiguousEntity {
+        Err(ImpactQueryError::AmbiguousEntity {
             name: name.to_string(),
             matches: matching,
         })
@@ -2456,9 +2435,9 @@ struct CurrentImports {
 fn current_imported_files(
     root: &Path,
     file_path: &str,
-) -> Result<Option<CurrentImports>, CachedImpactError> {
+) -> Result<Option<CurrentImports>, ImpactQueryError> {
     let content = std::fs::read_to_string(root.join(file_path))
-        .map_err(|_| CachedImpactError::CacheReadFailed)?;
+        .map_err(|_| ImpactQueryError::CacheReadFailed)?;
     let (files, has_unscoped_imports) =
         js_ts_import_source_files_from_filesystem_with_unscoped(root, file_path, &content);
     if has_unscoped_imports || !is_js_ts_cache_freshness_supported(file_path) {
@@ -2474,9 +2453,9 @@ fn current_imported_files(
     }))
 }
 
-fn file_has_default_re_export(root: &Path, file_path: &str) -> Result<bool, CachedImpactError> {
+fn file_has_default_re_export(root: &Path, file_path: &str) -> Result<bool, ImpactQueryError> {
     let content = std::fs::read_to_string(root.join(file_path))
-        .map_err(|_| CachedImpactError::CacheReadFailed)?;
+        .map_err(|_| ImpactQueryError::CacheReadFailed)?;
     Ok(js_ts_has_default_re_export_from_content(&content))
 }
 

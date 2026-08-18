@@ -17,6 +17,8 @@ use super::context::ContextOptions;
 use super::entities::EntitiesOptions;
 use super::impact::ImpactOptions;
 use super::log::LogOptions;
+use crate::impact_model::ImpactReport;
+use sem_core::parser::graph::EntityInfo;
 
 const DEFAULT_ENDPOINT: &str = "https://sem-cloud.fly.dev";
 const GITHUB_CLIENT_ID: &str = "Ov23lioE75FJYz4Mn7ZH";
@@ -745,7 +747,7 @@ pub struct CloudClient {
 /// Print `(using sem cloud)` to stderr on the first cloud call per session.
 static CLOUD_BANNER_SHOWN: AtomicBool = AtomicBool::new(false);
 
-fn show_cloud_banner() {
+pub(crate) fn show_cloud_banner() {
     if !CLOUD_BANNER_SHOWN.swap(true, Ordering::Relaxed) {
         eprintln!("{}", "(using sem cloud)".dimmed());
     }
@@ -1192,8 +1194,8 @@ fn working_tree_clean(repo_root: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Try to run `sem impact` via cloud. Returns Some(()) on success.
-pub fn try_cloud_impact(opts: &ImpactOptions) -> Option<()> {
+/// Try to resolve `sem impact` via cloud without rendering the result.
+pub fn try_cloud_impact(opts: &ImpactOptions) -> Option<ImpactReport> {
     // --tests needs test classification data the cloud API doesn't expose.
     if matches!(opts.mode, super::impact::ImpactMode::Tests) {
         return None;
@@ -1234,147 +1236,33 @@ pub fn try_cloud_impact(opts: &ImpactOptions) -> Option<()> {
     let result = client.impact(&repo_id, entity_name, &file_hint).ok()?;
 
     super::consent::record_outbound(&remote, "impact", entity_name);
-    show_cloud_banner();
 
-    let deps_json = || -> Vec<serde_json::Value> {
-        result.dependencies.iter().map(entity_brief_json).collect()
+    let entity = EntityInfo {
+        id: String::new(),
+        name: entity_name.to_string(),
+        entity_type: String::new(),
+        file_path: file_hint,
+        parent_id: None,
+        start_line: 0,
+        end_line: 0,
     };
-    let dependents_json =
-        || -> Vec<serde_json::Value> { result.dependents.iter().map(entity_brief_json).collect() };
-
-    let print_deps_section = || {
-        if !result.dependencies.is_empty() {
-            println!("\n  {} {}", "→".blue(), "depends on:".dimmed());
-            for dep in &result.dependencies {
-                println!(
-                    "    {} {} {} ({})",
-                    "→".blue(),
-                    dep.entity_type.dimmed(),
-                    dep.name.bold(),
-                    dep.file_path.dimmed(),
-                );
-            }
-        }
-    };
-    let print_dependents_section = || {
-        if !result.dependents.is_empty() {
-            println!("\n  {} {}", "←".yellow(), "depended on by:".dimmed());
-            for dep in &result.dependents {
-                println!(
-                    "    {} {} {} ({})",
-                    "←".yellow(),
-                    dep.entity_type.dimmed(),
-                    dep.name.bold(),
-                    dep.file_path.dimmed(),
-                );
-            }
-        }
-    };
-    let print_header = || {
-        println!(
-            "{} {}{}",
-            "⊕".green(),
-            entity_name.bold(),
-            if file_hint.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", file_hint.dimmed())
-            },
-        );
-    };
-
-    match opts.mode {
-        super::impact::ImpactMode::Deps => {
-            if opts.json {
-                let output = serde_json::json!({
-                    "entity": { "name": entity_name, "file": file_hint },
-                    "dependencies": deps_json(),
-                });
-                println!("{}", serde_json::to_string(&output).unwrap());
-            } else {
-                print_header();
-                if result.dependencies.is_empty() {
-                    println!("\n  {} {}", "✓".green().bold(), "No dependencies.".dimmed());
-                } else {
-                    print_deps_section();
-                }
-                println!();
-            }
-        }
-        super::impact::ImpactMode::Dependents => {
-            if opts.json {
-                let output = serde_json::json!({
-                    "entity": { "name": entity_name, "file": file_hint },
-                    "dependents": dependents_json(),
-                });
-                println!("{}", serde_json::to_string(&output).unwrap());
-            } else {
-                print_header();
-                if result.dependents.is_empty() {
-                    println!("\n  {} {}", "✓".green().bold(), "No dependents.".dimmed());
-                } else {
-                    print_dependents_section();
-                }
-                println!();
-            }
-        }
-        _ => {
-            // ImpactMode::All (Tests already returned None above)
-            if opts.json {
-                let impact_json: Vec<serde_json::Value> = result
-                    .transitive_impact
-                    .iter()
-                    .map(entity_brief_json)
-                    .collect();
-                let output = serde_json::json!({
-                    "entity": { "name": entity_name, "file": file_hint },
-                    "dependencies": deps_json(),
-                    "dependents": dependents_json(),
-                    "impact": {
-                        "total": impact_json.len(),
-                        "entities": impact_json,
-                    },
-                    "tests": [],
-                });
-                println!("{}", serde_json::to_string(&output).unwrap());
-            } else {
-                print_header();
-                print_deps_section();
-                print_dependents_section();
-
-                if !result.transitive_impact.is_empty() {
-                    println!(
-                        "\n  {} {}",
-                        "!".red().bold(),
-                        format!(
-                            "{} entities transitively affected:",
-                            result.transitive_impact.len()
-                        )
-                        .red(),
-                    );
-                    for imp in &result.transitive_impact {
-                        println!(
-                            "    {} {} {} ({})",
-                            "→".red(),
-                            imp.entity_type.dimmed(),
-                            imp.name.bold(),
-                            imp.file_path.dimmed(),
-                        );
-                    }
-                } else if result.dependencies.is_empty() && result.dependents.is_empty() {
-                    println!(
-                        "\n  {} {}",
-                        "✓".green().bold(),
-                        "No dependencies or dependents found.".dimmed()
-                    );
-                }
-
-                println!();
-            }
-        }
-    }
-
-    Some(())
+    let mut report = ImpactReport::for_entity(entity);
+    report.dependencies = result
+        .dependencies
+        .into_iter()
+        .map(cloud_entity_info)
+        .collect();
+    report.dependents = result
+        .dependents
+        .into_iter()
+        .map(cloud_entity_info)
+        .collect();
+    report.impact = result
+        .transitive_impact
+        .into_iter()
+        .map(|entity| (cloud_entity_info(entity), 0))
+        .collect();
+    Some(report)
 }
 
 /// Try to run `sem context` via cloud.
@@ -1657,15 +1545,16 @@ pub fn try_cloud_log(opts: &LogOptions) -> Option<()> {
     Some(())
 }
 
-// ─── Helper to convert CloudEntityBrief to JSON ─────────────────────────
-
-fn entity_brief_json(e: &CloudEntityBrief) -> serde_json::Value {
-    serde_json::json!({
-        "entityId": e.id,
-        "name": e.name,
-        "type": e.entity_type,
-        "file": e.file_path,
-    })
+fn cloud_entity_info(entity: CloudEntityBrief) -> EntityInfo {
+    EntityInfo {
+        id: entity.id,
+        name: entity.name,
+        entity_type: entity.entity_type,
+        file_path: entity.file_path,
+        parent_id: entity.parent_id,
+        start_line: entity.start_line.unwrap_or(0),
+        end_line: entity.end_line.unwrap_or(0),
+    }
 }
 
 #[cfg(test)]

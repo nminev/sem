@@ -207,6 +207,8 @@ mod tests {
             renamed_count: 0,
             reordered_count: 0,
             orphan_count: 0,
+            total_entities_before: 0,
+            total_entities_after: 0,
         };
         assert_eq!(format_nice(&result), "No semantic changes detected.\n");
     }
