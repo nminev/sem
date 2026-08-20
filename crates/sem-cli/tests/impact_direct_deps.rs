@@ -6,6 +6,15 @@ use std::{
 
 use tempfile::TempDir;
 
+fn sem_without_sidecar(repo: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sem"));
+    command
+        .current_dir(repo)
+        .env("SEM_NO_SIDECAR", "1")
+        .env("SEM_NO_AUTOWARM", "1");
+    command
+}
+
 fn output_text(output: &Output) -> String {
     format!(
         "stdout:\n{}\nstderr:\n{}",
@@ -282,8 +291,7 @@ fn impact_deps_no_cache_uses_direct_dependency_graph() {
     init_repo(repo.path());
 
     let output = assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_TIMINGS", "json")
             .args([
                 "impact",
@@ -317,8 +325,7 @@ fn impact_deps_uses_cached_sql_topology_query_on_second_run() {
     init_repo(repo.path());
 
     assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
             .output()
@@ -327,8 +334,7 @@ fn impact_deps_uses_cached_sql_topology_query_on_second_run() {
     );
 
     let output = assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .env("SEM_TIMINGS", "json")
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
@@ -360,8 +366,7 @@ fn impact_deps_uses_cached_sql_when_unrelated_file_changes() {
     init_repo(repo.path());
 
     assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
             .output()
@@ -375,8 +380,7 @@ fn impact_deps_uses_cached_sql_when_unrelated_file_changes() {
     );
 
     let output = assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .env("SEM_TIMINGS", "json")
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
@@ -407,8 +411,7 @@ fn impact_deps_misses_cached_sql_when_imported_file_changes() {
     init_repo(repo.path());
 
     assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
             .output()
@@ -422,8 +425,7 @@ fn impact_deps_misses_cached_sql_when_imported_file_changes() {
     );
 
     let output = assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .env("SEM_TIMINGS", "json")
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
@@ -448,8 +450,7 @@ fn impact_deps_misses_cached_sql_when_new_import_target_appears() {
     init_missing_import_target_repo(repo.path());
 
     assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
             .output()
@@ -464,8 +465,7 @@ fn impact_deps_misses_cached_sql_when_new_import_target_appears() {
     .unwrap();
 
     let output = assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .env("SEM_TIMINGS", "json")
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
@@ -490,8 +490,7 @@ fn impact_deps_misses_cached_sql_when_default_reexport_target_appears() {
     init_default_reexport_missing_target_repo(repo.path());
 
     assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .args([
                 "impact",
@@ -513,8 +512,7 @@ fn impact_deps_misses_cached_sql_when_default_reexport_target_appears() {
     .unwrap();
 
     let output = assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .env("SEM_TIMINGS", "json")
             .args([
@@ -550,8 +548,7 @@ fn impact_deps_misses_cached_sql_when_new_bare_import_target_appears() {
     init_bare_import_target_repo(repo.path());
 
     assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
             .output()
@@ -566,8 +563,7 @@ fn impact_deps_misses_cached_sql_when_new_bare_import_target_appears() {
     .unwrap();
 
     let output = assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .env("SEM_TIMINGS", "json")
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
@@ -593,8 +589,7 @@ fn impact_deps_misses_cached_sql_when_new_python_import_target_appears() {
     init_python_missing_import_target_repo(repo.path());
 
     assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .args(["impact", "consume", "--file", "b.py", "--deps", "--json"])
             .output()
@@ -609,8 +604,7 @@ fn impact_deps_misses_cached_sql_when_new_python_import_target_appears() {
     .unwrap();
 
     let output = assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .env("SEM_TIMINGS", "json")
             .args(["impact", "consume", "--file", "b.py", "--deps", "--json"])
@@ -636,8 +630,7 @@ fn impact_deps_does_not_use_cached_sql_outside_file_ext_scope() {
     init_repo(repo.path());
 
     assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
             .output()
@@ -645,8 +638,7 @@ fn impact_deps_does_not_use_cached_sql_outside_file_ext_scope() {
         "warm impact cache",
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_sem"))
-        .current_dir(repo.path())
+    let output = sem_without_sidecar(repo.path())
         .env("SEM_CACHE_DIR", cache.path())
         .env("SEM_TIMINGS", "json")
         .args([
@@ -673,8 +665,7 @@ fn impact_deps_does_not_use_cached_sql_after_semignore_excludes_target() {
     init_repo(repo.path());
 
     assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
             .output()
@@ -684,8 +675,7 @@ fn impact_deps_does_not_use_cached_sql_after_semignore_excludes_target() {
 
     fs::write(repo.path().join(".semignore"), "*.ts\n").unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_sem"))
-        .current_dir(repo.path())
+    let output = sem_without_sidecar(repo.path())
         .env("SEM_CACHE_DIR", cache.path())
         .env("SEM_TIMINGS", "json")
         .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
@@ -703,8 +693,7 @@ fn impact_deps_does_not_use_cache_first_for_unscoped_name_query() {
     init_repo(repo.path());
 
     assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .args(["impact", "consume", "--deps", "--json"])
             .output()
@@ -718,8 +707,7 @@ fn impact_deps_does_not_use_cache_first_for_unscoped_name_query() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_sem"))
-        .current_dir(repo.path())
+    let output = sem_without_sidecar(repo.path())
         .env("SEM_CACHE_DIR", cache.path())
         .env("SEM_TIMINGS", "json")
         .args(["impact", "consume", "--deps", "--json"])
@@ -737,8 +725,7 @@ fn impact_deps_uses_cached_sql_when_unrelated_source_file_is_deleted() {
     init_repo(repo.path());
 
     assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
             .output()
@@ -749,8 +736,7 @@ fn impact_deps_uses_cached_sql_when_unrelated_source_file_is_deleted() {
     fs::remove_file(repo.path().join("c.ts")).unwrap();
 
     let output = assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .env("SEM_TIMINGS", "json")
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
@@ -773,8 +759,7 @@ fn impact_deps_uses_cached_sql_when_unrelated_skip_worktree_source_file_is_missi
     init_repo(repo.path());
 
     assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
             .output()
@@ -786,8 +771,7 @@ fn impact_deps_uses_cached_sql_when_unrelated_skip_worktree_source_file_is_missi
     fs::remove_file(repo.path().join("c.ts")).unwrap();
 
     let output = assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .env("SEM_TIMINGS", "json")
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
@@ -813,8 +797,7 @@ fn impact_deps_uses_cached_sql_when_unrelated_symlink_source_target_is_missing()
     init_symlink_source_repo(repo.path(), &symlink_target);
 
     assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
             .output()
@@ -825,8 +808,7 @@ fn impact_deps_uses_cached_sql_when_unrelated_symlink_source_target_is_missing()
     fs::remove_file(&symlink_target).unwrap();
 
     let output = assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .env("SEM_TIMINGS", "json")
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
@@ -849,8 +831,7 @@ fn impact_deps_misses_topology_cache_when_side_effect_import_changes() {
     init_side_effect_import_repo(repo.path());
 
     assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
             .output()
@@ -862,8 +843,7 @@ fn impact_deps_misses_topology_cache_when_side_effect_import_changes() {
     rewrite_after_mtime_tick(&repo.path().join("a.ts"), "console.log('changed');\n");
 
     let output = assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .env("SEM_TIMINGS", "json")
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
@@ -888,8 +868,7 @@ fn cached_impact_file_hint_errors_match_graph_path() {
     init_repo(repo.path());
 
     assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
             .output()
@@ -897,8 +876,7 @@ fn cached_impact_file_hint_errors_match_graph_path() {
         "warm impact cache",
     );
 
-    let missing = Command::new(env!("CARGO_BIN_EXE_sem"))
-        .current_dir(repo.path())
+    let missing = sem_without_sidecar(repo.path())
         .env("SEM_CACHE_DIR", cache.path())
         .args(["impact", "missing", "--file", "b.ts", "--deps", "--json"])
         .output()
@@ -908,8 +886,7 @@ fn cached_impact_file_hint_errors_match_graph_path() {
     assert!(missing_stderr.contains("Entity 'missing' not found"));
     assert!(!missing_stderr.contains("not found in file"));
 
-    let wrong_file = Command::new(env!("CARGO_BIN_EXE_sem"))
-        .current_dir(repo.path())
+    let wrong_file = sem_without_sidecar(repo.path())
         .env("SEM_CACHE_DIR", cache.path())
         .args(["impact", "source", "--file", "b.ts", "--deps", "--json"])
         .output()
@@ -926,8 +903,7 @@ fn impact_all_and_tests_match_no_cache_from_topology_cache() {
     init_topology_repo(repo.path());
 
     assert_success(
-        Command::new(env!("CARGO_BIN_EXE_sem"))
-            .current_dir(repo.path())
+        sem_without_sidecar(repo.path())
             .env("SEM_CACHE_DIR", cache.path())
             .args(["impact", "source", "--file", "a.ts", "--json"])
             .output()
@@ -946,8 +922,7 @@ fn impact_all_and_tests_match_no_cache_from_topology_cache() {
         no_cache_args.push("--no-cache");
 
         let cached = assert_success(
-            Command::new(env!("CARGO_BIN_EXE_sem"))
-                .current_dir(repo.path())
+            sem_without_sidecar(repo.path())
                 .env("SEM_CACHE_DIR", cache.path())
                 .env("SEM_TIMINGS", "json")
                 .args(&cached_args)
@@ -956,8 +931,7 @@ fn impact_all_and_tests_match_no_cache_from_topology_cache() {
             "cached topology impact",
         );
         let no_cache = assert_success(
-            Command::new(env!("CARGO_BIN_EXE_sem"))
-                .current_dir(repo.path())
+            sem_without_sidecar(repo.path())
                 .args(&no_cache_args)
                 .output()
                 .unwrap(),

@@ -5,7 +5,10 @@ use sem_core::git::bridge::GitBridge;
 use sem_core::parser::graph::{EntityGraph, EntityInfo};
 use sem_mcp::cache::CacheSourceScope;
 
-use crate::cache::{CachedImpactError, CachedImpactMode, CachedImpactResult, DiskCache};
+use crate::cache::{CachedImpactMode, DiskCache};
+use crate::impact_model::{
+    ImpactQueryError, ImpactReport, ImpactSource, ResolvedImpact, TestEvidence,
+};
 use crate::timings::Timings;
 
 pub struct ImpactOptions {
@@ -50,18 +53,38 @@ fn build_with_spinner<T>(
 }
 
 pub fn impact_command(opts: ImpactOptions) {
-    // A resident server beats the cloud path on both freshness and latency,
-    // so the sidecar goes first.
-    if try_sidecar_impact(&opts) {
-        return;
-    }
-
-    if super::cloud::try_cloud_impact(&opts).is_some() {
-        return;
-    }
-
     let started = std::time::Instant::now();
     let mut timings = Timings::from_env("impact");
+
+    let resolved = match resolve_impact(&opts, &mut timings) {
+        Ok(resolved) => resolved,
+        Err(error) => print_impact_error(error),
+    };
+    let source = resolved.source;
+    render_and_finish_impact(&resolved, &opts, timings);
+    if source == ImpactSource::Local {
+        super::consent::maybe_cloud_tip(&opts.cwd, started.elapsed());
+    }
+}
+
+fn resolve_impact(
+    opts: &ImpactOptions,
+    timings: &mut Timings,
+) -> Result<ResolvedImpact, ImpactQueryError> {
+    // A resident server beats the cloud path on both freshness and latency,
+    // so the sidecar goes first.
+    let sidecar_report = try_sidecar_impact(opts);
+    timings.mark("sidecar_probe");
+    if let Some(report) = sidecar_report {
+        return Ok(ResolvedImpact::new(report, ImpactSource::Sidecar));
+    }
+
+    let cloud_report = super::cloud::try_cloud_impact(opts);
+    timings.mark("cloud_probe");
+    if let Some(report) = cloud_report {
+        return Ok(ResolvedImpact::new(report, ImpactSource::Cloud));
+    }
+
     let root = match GitBridge::open(Path::new(&opts.cwd)) {
         Ok(git) => git.repo_root().to_path_buf(),
         Err(_) => Path::new(&opts.cwd).to_path_buf(),
@@ -86,17 +109,21 @@ pub fn impact_command(opts: ImpactOptions) {
         match DiskCache::open(root) {
             Ok(disk) => {
                 timings.mark("cache_open");
-                if try_cached_impact_query(
+                match try_cached_impact_query(
                     &disk,
                     root,
                     &[],
-                    &opts,
+                    opts,
                     file_hint.as_deref(),
                     source_scope,
                     true,
-                    &mut timings,
+                    timings,
                 ) {
-                    return;
+                    Ok(Some(report)) => {
+                        return Ok(ResolvedImpact::new(report, ImpactSource::DiskCache));
+                    }
+                    Ok(None) => {}
+                    Err(error) => return Err(error),
                 }
             }
             Err(_) => {
@@ -117,17 +144,21 @@ pub fn impact_command(opts: ImpactOptions) {
         match DiskCache::open(root) {
             Ok(disk) => {
                 timings.mark("cache_open");
-                if try_cached_impact_query(
+                match try_cached_impact_query(
                     &disk,
                     root,
                     &file_paths,
-                    &opts,
+                    opts,
                     file_hint.as_deref(),
                     source_scope,
                     false,
-                    &mut timings,
+                    timings,
                 ) {
-                    return;
+                    Ok(Some(report)) => {
+                        return Ok(ResolvedImpact::new(report, ImpactSource::DiskCache));
+                    }
+                    Ok(None) => {}
+                    Err(error) => return Err(error),
                 }
             }
             Err(_) => {
@@ -136,7 +167,7 @@ pub fn impact_command(opts: ImpactOptions) {
         }
     }
 
-    match opts.mode {
+    let report = match opts.mode {
         ImpactMode::Deps => {
             let graph = build_with_spinner(
                 file_paths.len(),
@@ -151,7 +182,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &registry,
                             opts.no_cache,
                             source_scope,
-                            &mut timings,
+                            timings,
                             move |entity| {
                                 if let Some(id) = entity_id.as_deref() {
                                     return entity.id == id;
@@ -175,7 +206,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &registry,
                             opts.no_cache,
                             source_scope,
-                            &mut timings,
+                            timings,
                         )
                     }
                 },
@@ -186,10 +217,15 @@ pub fn impact_command(opts: ImpactOptions) {
                 opts.entity_name.as_deref(),
                 opts.entity_id.as_deref(),
                 file_hint.as_deref(),
-            );
+            )?;
             timings.mark("entity_lookup");
-            print_deps(&graph, entity, opts.json);
-            timings.mark("cli_output_serialization");
+            let mut report = ImpactReport::for_entity(entity.clone());
+            report.dependencies = graph
+                .get_dependencies(&entity.id)
+                .into_iter()
+                .cloned()
+                .collect();
+            report
         }
         ImpactMode::Dependents => {
             let graph = build_with_spinner(
@@ -202,7 +238,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &registry,
                             opts.no_cache,
                             source_scope,
-                            &mut timings,
+                            timings,
                         )
                     } else {
                         super::graph::get_or_build_graph_topology_with_timings(
@@ -211,7 +247,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &registry,
                             opts.no_cache,
                             source_scope,
-                            &mut timings,
+                            timings,
                         )
                     }
                 },
@@ -222,10 +258,15 @@ pub fn impact_command(opts: ImpactOptions) {
                 opts.entity_name.as_deref(),
                 opts.entity_id.as_deref(),
                 file_hint.as_deref(),
-            );
+            )?;
             timings.mark("entity_lookup");
-            print_dependents(&graph, entity, opts.json);
-            timings.mark("cli_output_serialization");
+            let mut report = ImpactReport::for_entity(entity.clone());
+            report.dependents = graph
+                .get_dependents(&entity.id)
+                .into_iter()
+                .cloned()
+                .collect();
+            report
         }
         ImpactMode::Tests | ImpactMode::All => {
             if file_paths.len() > LARGE_IMPACT_CACHE_MISS_FILE_THRESHOLD {
@@ -238,7 +279,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &registry,
                             opts.no_cache,
                             source_scope,
-                            &mut timings,
+                            timings,
                         )
                     },
                     |gd| match gd {
@@ -255,21 +296,19 @@ pub fn impact_command(opts: ImpactOptions) {
                             opts.entity_name.as_deref(),
                             opts.entity_id.as_deref(),
                             file_hint.as_deref(),
-                        );
+                        )?;
                         timings.mark("entity_lookup");
                         match opts.mode {
-                            ImpactMode::Tests => print_tests(
+                            ImpactMode::Tests => report_tests(
                                 &graph,
                                 entity,
                                 &all_entities,
-                                opts.json,
                                 &registry.custom_test_dirs,
                             ),
-                            ImpactMode::All => print_all(
+                            ImpactMode::All => report_all(
                                 &graph,
                                 entity,
                                 &all_entities,
-                                opts.json,
                                 opts.depth,
                                 &registry.custom_test_dirs,
                             ),
@@ -285,19 +324,15 @@ pub fn impact_command(opts: ImpactOptions) {
                             opts.entity_name.as_deref(),
                             opts.entity_id.as_deref(),
                             file_hint.as_deref(),
-                        );
+                        )?;
                         timings.mark("entity_lookup");
                         match opts.mode {
                             ImpactMode::Tests => {
-                                print_tests_with_ids(&graph, entity, &test_entity_ids, opts.json)
+                                report_tests_with_ids(&graph, entity, &test_entity_ids)
                             }
-                            ImpactMode::All => print_all_with_ids(
-                                &graph,
-                                entity,
-                                &test_entity_ids,
-                                opts.json,
-                                opts.depth,
-                            ),
+                            ImpactMode::All => {
+                                report_all_with_ids(&graph, entity, &test_entity_ids, opts.depth)
+                            }
                             _ => unreachable!(),
                         }
                     }
@@ -312,7 +347,7 @@ pub fn impact_command(opts: ImpactOptions) {
                             &registry,
                             opts.no_cache,
                             source_scope,
-                            &mut timings,
+                            timings,
                         )
                     },
                     |(g, _)| g.entities.len(),
@@ -322,37 +357,46 @@ pub fn impact_command(opts: ImpactOptions) {
                     opts.entity_name.as_deref(),
                     opts.entity_id.as_deref(),
                     file_hint.as_deref(),
-                );
+                )?;
                 timings.mark("entity_lookup");
                 match opts.mode {
-                    ImpactMode::Tests => print_tests(
+                    ImpactMode::Tests => {
+                        report_tests(&graph, entity, &all_entities, &registry.custom_test_dirs)
+                    }
+                    ImpactMode::All => report_all(
                         &graph,
                         entity,
                         &all_entities,
-                        opts.json,
-                        &registry.custom_test_dirs,
-                    ),
-                    ImpactMode::All => print_all(
-                        &graph,
-                        entity,
-                        &all_entities,
-                        opts.json,
                         opts.depth,
                         &registry.custom_test_dirs,
                     ),
                     _ => unreachable!(),
                 }
             }
-            timings.mark("cli_output_serialization");
         }
+    };
+    Ok(ResolvedImpact::new(report, ImpactSource::Local))
+}
+
+fn render_and_finish_impact(resolved: &ResolvedImpact, opts: &ImpactOptions, mut timings: Timings) {
+    if resolved.source == ImpactSource::Cloud && !timings.is_json() {
+        super::cloud::show_cloud_banner();
     }
+    print_impact_report(
+        &resolved.report,
+        resolved.source,
+        opts.mode,
+        opts.json,
+        opts.depth,
+    );
+    timings.mark("cli_output_serialization");
+    timings.source(resolved.source.as_str());
     timings.finish();
-    super::consent::maybe_cloud_tip(&opts.cwd, started.elapsed());
 }
 
 /// The wire shape of the sidecar's `impact` op — real serialized `EntityInfo`s,
-/// so this deserializes into the exact structs the cached-result printers
-/// consume and fast-path output is identical to local output.
+/// so this deserializes into the backend-neutral report consumed by the same
+/// renderer as local and cached results.
 #[derive(serde::Deserialize)]
 struct SidecarImpactResult {
     entity: EntityInfo,
@@ -367,25 +411,25 @@ struct SidecarImpactResult {
 /// server can answer with identical semantics: default source scope, resolve
 /// by name. Everything else — and any sidecar miss, error, or ambiguity —
 /// falls back to the normal local path and its richer diagnostics.
-fn try_sidecar_impact(opts: &ImpactOptions) -> bool {
+fn try_sidecar_impact(opts: &ImpactOptions) -> Option<ImpactReport> {
     if opts.no_cache
         || opts.no_default_excludes
         || !opts.file_exts.is_empty()
         || opts.entity_id.is_some()
     {
-        return false;
+        return None;
     }
     let Some(name) = opts.entity_name.as_deref() else {
-        return false;
+        return None;
     };
     let Ok(git) = GitBridge::open(Path::new(&opts.cwd)) else {
-        return false;
+        return None;
     };
     let root = git.repo_root().to_path_buf();
     // A .semignore means this repo's default scope is custom; the resident
     // server may not share it, so stay local (mirrors cache_source_scope).
     if root.join(".semignore").exists() {
-        return false;
+        return None;
     }
 
     let mut request = serde_json::json!({ "op": "impact", "name": name, "depth": opts.depth });
@@ -398,13 +442,13 @@ fn try_sidecar_impact(opts: &ImpactOptions) -> bool {
     }
 
     let Some(response) = super::sidecar::query(&root, &request) else {
-        return false;
+        return None;
     };
     let Some(result) = response.get("result") else {
-        return false;
+        return None;
     };
     let Ok(parsed) = serde_json::from_value::<SidecarImpactResult>(result.clone()) else {
-        return false;
+        return None;
     };
 
     // An empty tests answer is not authoritative: graph edges miss
@@ -412,18 +456,18 @@ fn try_sidecar_impact(opts: &ImpactOptions) -> bool {
     // lexical fallback for exactly that. Fall through instead of printing
     // "No tests found" from the fast path.
     if matches!(opts.mode, ImpactMode::Tests | ImpactMode::All) && parsed.tests.is_empty() {
-        return false;
+        return None;
     }
-    let cached = CachedImpactResult {
+    let report = ImpactReport {
         entity: parsed.entity,
         dependencies: parsed.dependencies,
         dependents: parsed.dependents,
         impact: parsed.impact,
         tests: parsed.tests,
         tests_truncated: false,
+        test_evidence: Default::default(),
     };
-    print_cached_result(&cached, opts.mode, opts.json, opts.depth);
-    true
+    Some(report)
 }
 
 fn try_cached_impact_query(
@@ -435,7 +479,7 @@ fn try_cached_impact_query(
     source_scope: CacheSourceScope,
     cache_first: bool,
     timings: &mut Timings,
-) -> bool {
+) -> Result<Option<ImpactReport>, ImpactQueryError> {
     match disk.query_impact_topology(
         root,
         file_paths,
@@ -454,22 +498,19 @@ fn try_cached_impact_query(
             // Fall through to the full path, which has a lexical fallback.
             if matches!(opts.mode, ImpactMode::Tests) && result.tests.is_empty() {
                 timings.mark("cache_tests_empty_fallthrough");
-                return false;
+                return Ok(None);
             }
-            print_cached_result(&result, opts.mode, opts.json, opts.depth);
-            timings.mark("cli_output_serialization");
-            timings.finish();
-            true
+            Ok(Some(result))
         }
         Ok(None) => {
             timings.mark("cache_topology_impact_miss");
-            false
+            Ok(None)
         }
-        Err(CachedImpactError::CacheReadFailed) => {
+        Err(ImpactQueryError::CacheReadFailed) => {
             timings.mark("cache_topology_impact_query_failed");
-            false
+            Ok(None)
         }
-        Err(err) => print_cached_error(err),
+        Err(error) => Err(error),
     }
 }
 
@@ -487,23 +528,16 @@ fn find_entity<'a>(
     name: Option<&str>,
     entity_id: Option<&str>,
     file_hint: Option<&str>,
-) -> &'a sem_core::parser::graph::EntityInfo {
+) -> Result<&'a EntityInfo, ImpactQueryError> {
     // Direct lookup by entity ID
     if let Some(id) = entity_id {
         if let Some(e) = graph.entities.get(id) {
-            return e;
+            return Ok(e);
         }
-        eprintln!("{} Entity ID '{}' not found", "error:".red().bold(), id);
-        std::process::exit(1);
+        return Err(ImpactQueryError::EntityIdNotFound(id.to_string()));
     }
 
-    let name = name.unwrap_or_else(|| {
-        eprintln!(
-            "{} Either entity name or --entity-id is required",
-            "error:".red().bold()
-        );
-        std::process::exit(1);
-    });
+    let name = name.ok_or(ImpactQueryError::MissingEntityQuery)?;
 
     let mut matching: Vec<_> = graph
         .entities
@@ -512,8 +546,7 @@ fn find_entity<'a>(
         .collect();
 
     if matching.is_empty() {
-        eprintln!("{} Entity '{}' not found", "error:".red().bold(), name);
-        std::process::exit(1);
+        return Err(ImpactQueryError::EntityNotFound(name.to_string()));
     }
 
     if let Some(file) = file_hint {
@@ -523,40 +556,28 @@ fn find_entity<'a>(
             .copied()
             .collect();
         if filtered.len() == 1 {
-            return filtered[0];
+            return Ok(filtered[0]);
         }
         if filtered.is_empty() {
-            eprintln!(
-                "{} Entity '{}' not found in file '{}'",
-                "error:".red().bold(),
-                name,
-                file
-            );
-            std::process::exit(1);
+            return Err(ImpactQueryError::EntityNotFoundInFile {
+                name: name.to_string(),
+                file: file.to_string(),
+            });
         }
         // Multiple matches even within the file — fall through to ambiguity error
         matching = filtered;
     }
 
     if matching.len() == 1 {
-        return matching[0];
+        return Ok(matching[0]);
     }
 
-    // Multiple matches — report ambiguity
+    // Multiple matches — preserve the candidates for the presentation layer.
     matching.sort_by_key(|e| (&e.file_path, e.start_line));
-    eprintln!(
-        "{} Entity name '{}' is ambiguous ({} matches). Specify --file or --entity-id:",
-        "error:".red().bold(),
-        name,
-        matching.len()
-    );
-    for m in &matching {
-        eprintln!(
-            "  {} {} ({}:L{})",
-            m.entity_type, m.id, m.file_path, m.start_line
-        );
-    }
-    std::process::exit(1);
+    Err(ImpactQueryError::AmbiguousEntity {
+        name: name.to_string(),
+        matches: matching.into_iter().cloned().collect(),
+    })
 }
 
 fn entity_json(e: &sem_core::parser::graph::EntityInfo) -> serde_json::Value {
@@ -564,10 +585,6 @@ fn entity_json(e: &sem_core::parser::graph::EntityInfo) -> serde_json::Value {
         "entityId": e.id, "name": e.name, "type": e.entity_type,
         "file": e.file_path, "lines": [e.start_line, e.end_line],
     })
-}
-
-fn entity_list_json(entities: &[&sem_core::parser::graph::EntityInfo]) -> Vec<serde_json::Value> {
-    entities.iter().map(|e| entity_json(*e)).collect()
 }
 
 fn owned_entity_list_json(entities: &[EntityInfo]) -> Vec<serde_json::Value> {
@@ -586,24 +603,189 @@ fn print_entity_header(e: &sem_core::parser::graph::EntityInfo) {
     );
 }
 
-fn print_cached_result(result: &CachedImpactResult, mode: ImpactMode, json: bool, depth: usize) {
+fn print_impact_report(
+    result: &ImpactReport,
+    source: ImpactSource,
+    mode: ImpactMode,
+    json: bool,
+    depth: usize,
+) {
+    if source == ImpactSource::Cloud {
+        print_cloud_impact_report(result, mode, json);
+        return;
+    }
     match mode {
         ImpactMode::Deps => {
-            print_cached_deps(&result.entity, &result.dependencies, json);
+            print_dependencies(&result.entity, &result.dependencies, json);
         }
         ImpactMode::Dependents => {
-            print_cached_dependents(&result.entity, &result.dependents, json);
+            print_dependents(&result.entity, &result.dependents, json);
         }
         ImpactMode::Tests => {
-            print_cached_tests(&result.entity, &result.tests, result.tests_truncated, json);
+            if result.test_evidence == TestEvidence::LexicalFallback && !json {
+                println!(
+                    "{}",
+                    "  (no call-graph edges reach tests; lexical fallback — test bodies naming the entity)"
+                        .dimmed()
+                );
+            }
+            print_tests(&result.entity, &result.tests, result.tests_truncated, json);
         }
         ImpactMode::All => {
-            print_cached_all(result, json, depth);
+            print_all(result, json, depth);
         }
     }
 }
 
-fn print_cached_deps(entity: &EntityInfo, deps: &[EntityInfo], json: bool) {
+fn cloud_entity_json(entity: &EntityInfo) -> serde_json::Value {
+    serde_json::json!({
+        "entityId": entity.id,
+        "name": entity.name,
+        "type": entity.entity_type,
+        "file": entity.file_path,
+    })
+}
+
+fn print_cloud_impact_report(result: &ImpactReport, mode: ImpactMode, json: bool) {
+    let target_json = || {
+        serde_json::json!({
+            "name": result.entity.name,
+            "file": result.entity.file_path,
+        })
+    };
+    let entities_json =
+        |entities: &[EntityInfo]| entities.iter().map(cloud_entity_json).collect::<Vec<_>>();
+    let print_header = || {
+        println!(
+            "{} {}{}",
+            "⊕".green(),
+            result.entity.name.bold(),
+            if result.entity.file_path.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", result.entity.file_path.dimmed())
+            },
+        );
+    };
+    let print_dependencies = || {
+        if !result.dependencies.is_empty() {
+            println!("\n  {} {}", "→".blue(), "depends on:".dimmed());
+            for dependency in &result.dependencies {
+                println!(
+                    "    {} {} {} ({})",
+                    "→".blue(),
+                    dependency.entity_type.dimmed(),
+                    dependency.name.bold(),
+                    dependency.file_path.dimmed(),
+                );
+            }
+        }
+    };
+    let print_dependents = || {
+        if !result.dependents.is_empty() {
+            println!("\n  {} {}", "←".yellow(), "depended on by:".dimmed());
+            for dependent in &result.dependents {
+                println!(
+                    "    {} {} {} ({})",
+                    "←".yellow(),
+                    dependent.entity_type.dimmed(),
+                    dependent.name.bold(),
+                    dependent.file_path.dimmed(),
+                );
+            }
+        }
+    };
+
+    match mode {
+        ImpactMode::Deps => {
+            if json {
+                let output = serde_json::json!({
+                    "entity": target_json(),
+                    "dependencies": entities_json(&result.dependencies),
+                });
+                println!("{}", serde_json::to_string(&output).unwrap());
+            } else {
+                print_header();
+                if result.dependencies.is_empty() {
+                    println!("\n  {} {}", "✓".green().bold(), "No dependencies.".dimmed());
+                } else {
+                    print_dependencies();
+                }
+                println!();
+            }
+        }
+        ImpactMode::Dependents => {
+            if json {
+                let output = serde_json::json!({
+                    "entity": target_json(),
+                    "dependents": entities_json(&result.dependents),
+                });
+                println!("{}", serde_json::to_string(&output).unwrap());
+            } else {
+                print_header();
+                if result.dependents.is_empty() {
+                    println!("\n  {} {}", "✓".green().bold(), "No dependents.".dimmed());
+                } else {
+                    print_dependents();
+                }
+                println!();
+            }
+        }
+        ImpactMode::All => {
+            if json {
+                let impact = result
+                    .impact
+                    .iter()
+                    .map(|(entity, _)| cloud_entity_json(entity))
+                    .collect::<Vec<_>>();
+                let output = serde_json::json!({
+                    "entity": target_json(),
+                    "dependencies": entities_json(&result.dependencies),
+                    "dependents": entities_json(&result.dependents),
+                    "impact": {
+                        "total": impact.len(),
+                        "entities": impact,
+                    },
+                    "tests": [],
+                });
+                println!("{}", serde_json::to_string(&output).unwrap());
+                return;
+            }
+
+            print_header();
+            print_dependencies();
+            print_dependents();
+            if result.impact.is_empty() {
+                if result.dependencies.is_empty() && result.dependents.is_empty() {
+                    println!(
+                        "\n  {} {}",
+                        "✓".green().bold(),
+                        "No dependencies or dependents found.".dimmed()
+                    );
+                }
+            } else {
+                println!(
+                    "\n  {} {}",
+                    "!".red().bold(),
+                    format!("{} entities transitively affected:", result.impact.len()).red(),
+                );
+                for (entity, _) in &result.impact {
+                    println!(
+                        "    {} {} {} ({})",
+                        "→".red(),
+                        entity.entity_type.dimmed(),
+                        entity.name.bold(),
+                        entity.file_path.dimmed(),
+                    );
+                }
+            }
+            println!();
+        }
+        ImpactMode::Tests => unreachable!("cloud impact does not support test queries"),
+    }
+}
+
+fn print_dependencies(entity: &EntityInfo, deps: &[EntityInfo], json: bool) {
     if json {
         let output = serde_json::json!({
             "entity": entity_json(entity),
@@ -630,7 +812,7 @@ fn print_cached_deps(entity: &EntityInfo, deps: &[EntityInfo], json: bool) {
     }
 }
 
-fn print_cached_dependents(entity: &EntityInfo, dependents: &[EntityInfo], json: bool) {
+fn print_dependents(entity: &EntityInfo, dependents: &[EntityInfo], json: bool) {
     if json {
         let output = serde_json::json!({
             "entity": entity_json(entity),
@@ -657,7 +839,7 @@ fn print_cached_dependents(entity: &EntityInfo, dependents: &[EntityInfo], json:
     }
 }
 
-fn print_cached_tests(entity: &EntityInfo, tests: &[EntityInfo], truncated: bool, json: bool) {
+fn print_tests(entity: &EntityInfo, tests: &[EntityInfo], truncated: bool, json: bool) {
     if json {
         let mut output = serde_json::json!({
             "entity": entity_json(entity),
@@ -705,12 +887,12 @@ fn print_cached_tests(entity: &EntityInfo, tests: &[EntityInfo], truncated: bool
                 }
             }
         }
-        print_cached_tests_truncation_warning(truncated);
+        print_tests_truncation_warning(truncated);
         println!();
     }
 }
 
-fn print_cached_tests_truncation_warning(truncated: bool) {
+fn print_tests_truncation_warning(truncated: bool) {
     if truncated {
         println!(
             "\n  {} {}",
@@ -720,7 +902,7 @@ fn print_cached_tests_truncation_warning(truncated: bool) {
     }
 }
 
-fn print_cached_all(result: &CachedImpactResult, json: bool, depth: usize) {
+fn print_all(result: &ImpactReport, json: bool, depth: usize) {
     if json {
         let impact_entities: Vec<serde_json::Value> = result
             .impact
@@ -857,32 +1039,32 @@ fn print_cached_all(result: &CachedImpactResult, json: bool, depth: usize) {
             );
         }
     }
-    print_cached_tests_truncation_warning(result.tests_truncated);
+    print_tests_truncation_warning(result.tests_truncated);
 
     println!();
 }
 
-fn print_cached_error(error: CachedImpactError) -> ! {
+fn print_impact_error(error: ImpactQueryError) -> ! {
     match error {
-        CachedImpactError::CacheReadFailed => {
+        ImpactQueryError::CacheReadFailed => {
             eprintln!(
                 "{} Failed to read the cached impact graph",
                 "error:".red().bold()
             );
         }
-        CachedImpactError::MissingEntityQuery => {
+        ImpactQueryError::MissingEntityQuery => {
             eprintln!(
                 "{} Either entity name or --entity-id is required",
                 "error:".red().bold()
             );
         }
-        CachedImpactError::EntityIdNotFound(id) => {
+        ImpactQueryError::EntityIdNotFound(id) => {
             eprintln!("{} Entity ID '{}' not found", "error:".red().bold(), id);
         }
-        CachedImpactError::EntityNotFound(name) => {
+        ImpactQueryError::EntityNotFound(name) => {
             eprintln!("{} Entity '{}' not found", "error:".red().bold(), name);
         }
-        CachedImpactError::EntityNotFoundInFile { name, file } => {
+        ImpactQueryError::EntityNotFoundInFile { name, file } => {
             eprintln!(
                 "{} Entity '{}' not found in file '{}'",
                 "error:".red().bold(),
@@ -890,7 +1072,7 @@ fn print_cached_error(error: CachedImpactError) -> ! {
                 file
             );
         }
-        CachedImpactError::AmbiguousEntity { name, mut matches } => {
+        ImpactQueryError::AmbiguousEntity { name, mut matches } => {
             matches.sort_by_key(|entity| {
                 (
                     entity.file_path.clone(),
@@ -915,82 +1097,24 @@ fn print_cached_error(error: CachedImpactError) -> ! {
     std::process::exit(1);
 }
 
-fn print_deps(graph: &EntityGraph, entity: &sem_core::parser::graph::EntityInfo, json: bool) {
-    let deps = graph.get_dependencies(&entity.id);
-
-    if json {
-        let output = serde_json::json!({
-            "entity": entity_json(entity),
-            "dependencies": entity_list_json(&deps),
-        });
-        println!("{}", serde_json::to_string(&output).unwrap());
-    } else {
-        print_entity_header(entity);
-        if deps.is_empty() {
-            println!("\n  {} {}", "✓".green().bold(), "No dependencies.".dimmed());
-        } else {
-            println!("\n  {} {}", "→".blue(), "depends on:".dimmed());
-            for dep in &deps {
-                println!(
-                    "    {} {} {} ({})",
-                    "→".blue(),
-                    dep.entity_type.dimmed(),
-                    dep.name.bold(),
-                    dep.file_path.dimmed(),
-                );
-            }
-        }
-        println!();
-    }
-}
-
-fn print_dependents(graph: &EntityGraph, entity: &sem_core::parser::graph::EntityInfo, json: bool) {
-    let dependents = graph.get_dependents(&entity.id);
-
-    if json {
-        let output = serde_json::json!({
-            "entity": entity_json(entity),
-            "dependents": entity_list_json(&dependents),
-        });
-        println!("{}", serde_json::to_string(&output).unwrap());
-    } else {
-        print_entity_header(entity);
-        if dependents.is_empty() {
-            println!("\n  {} {}", "✓".green().bold(), "No dependents.".dimmed());
-        } else {
-            println!("\n  {} {}", "←".yellow(), "depended on by:".dimmed());
-            for dep in &dependents {
-                println!(
-                    "    {} {} {} ({})",
-                    "←".yellow(),
-                    dep.entity_type.dimmed(),
-                    dep.name.bold(),
-                    dep.file_path.dimmed(),
-                );
-            }
-        }
-        println!();
-    }
-}
-
-fn print_tests(
+fn report_tests(
     graph: &EntityGraph,
     entity: &EntityInfo,
     all_entities: &[sem_core::model::entity::SemanticEntity],
-    json: bool,
     custom_test_dirs: &[String],
-) {
+) -> ImpactReport {
+    let mut report = ImpactReport::for_entity(entity.clone());
     let tests = graph.test_impact_with_custom_dirs(&entity.id, all_entities, custom_test_dirs);
     if !tests.is_empty() {
-        print_tests_result(entity, &tests, json);
-        return;
+        report.tests = tests.into_iter().cloned().collect();
+        return report;
     }
     // Graph edges can miss tests that call the target through a module
     // namespace ("xr.where(...)"): the attribute call resolves to no entity.
     // Fall back to lexical reachability — test bodies naming the entity as a
     // word — and say so, since it is weaker evidence than a call edge.
     let test_ids = graph.filter_test_entities_with_custom_dirs(all_entities, custom_test_dirs);
-    let owned: Vec<EntityInfo> = all_entities
+    report.tests = all_entities
         .iter()
         .filter(|e| test_ids.contains(&e.id) && word_hit(&e.content, &entity.name))
         .map(|e| EntityInfo {
@@ -1003,15 +1127,10 @@ fn print_tests(
             end_line: e.end_line,
         })
         .collect();
-    if !owned.is_empty() && !json {
-        println!(
-            "{}",
-            "  (no call-graph edges reach tests; lexical fallback — test bodies naming the entity)"
-                .dimmed()
-        );
+    if !report.tests.is_empty() {
+        report.test_evidence = TestEvidence::LexicalFallback;
     }
-    let refs: Vec<&EntityInfo> = owned.iter().collect();
-    print_tests_result(entity, &refs, json);
+    report
 }
 
 /// True when `name` appears in `body` as a whole word (not as a substring of
@@ -1039,80 +1158,38 @@ pub(crate) fn word_hit(body: &str, name: &str) -> bool {
     false
 }
 
-fn print_tests_with_ids(
+fn report_tests_with_ids(
     graph: &EntityGraph,
     entity: &EntityInfo,
     test_entity_ids: &HashSet<String>,
-    json: bool,
-) {
-    let tests = test_impact_from_ids(graph, &entity.id, test_entity_ids);
-    print_tests_result(entity, &tests, json);
+) -> ImpactReport {
+    let mut report = ImpactReport::for_entity(entity.clone());
+    report.tests = test_impact_from_ids(graph, &entity.id, test_entity_ids)
+        .into_iter()
+        .cloned()
+        .collect();
+    report
 }
 
-fn print_tests_result(entity: &EntityInfo, tests: &[&EntityInfo], json: bool) {
-    if json {
-        let output = serde_json::json!({
-            "entity": entity_json(entity),
-            "tests": entity_list_json(tests),
-        });
-        println!("{}", serde_json::to_string(&output).unwrap());
-    } else {
-        print_entity_header(entity);
-        if tests.is_empty() {
-            println!("\n  {} {}", "✓".green().bold(), "No tests found.".dimmed());
-        } else {
-            println!(
-                "\n  {} {}",
-                "⚡".yellow(),
-                format!("{} tests affected:", tests.len()).bold()
-            );
-            let mut by_file: std::collections::HashMap<&str, Vec<_>> =
-                std::collections::HashMap::new();
-            for t in tests {
-                by_file.entry(t.file_path.as_str()).or_default().push(t);
-            }
-            let mut files: Vec<_> = by_file.keys().copied().collect();
-            files.sort();
-            for file in files {
-                println!("    {}", file.bold());
-                let mut entities = by_file[file].clone();
-                entities.sort_by_key(|e| e.start_line);
-                for t in entities {
-                    println!(
-                        "      {} {} (L{}–{})",
-                        t.entity_type.dimmed(),
-                        t.name.bold(),
-                        t.start_line,
-                        t.end_line,
-                    );
-                }
-            }
-        }
-        println!();
-    }
-}
-
-fn print_all(
+fn report_all(
     graph: &EntityGraph,
     entity: &EntityInfo,
     all_entities: &[sem_core::model::entity::SemanticEntity],
-    json: bool,
     depth: usize,
     custom_test_dirs: &[String],
-) {
+) -> ImpactReport {
     let tests = graph.test_impact_with_custom_dirs(&entity.id, all_entities, custom_test_dirs);
-    print_all_with_tests(graph, entity, &tests, json, depth);
+    report_all_with_tests(graph, entity, &tests, depth)
 }
 
-fn print_all_with_ids(
+fn report_all_with_ids(
     graph: &EntityGraph,
     entity: &EntityInfo,
     test_entity_ids: &HashSet<String>,
-    json: bool,
     depth: usize,
-) {
+) -> ImpactReport {
     let tests = test_impact_from_ids(graph, &entity.id, test_entity_ids);
-    print_all_with_tests(graph, entity, &tests, json, depth);
+    report_all_with_tests(graph, entity, &tests, depth)
 }
 
 fn test_impact_from_ids<'a>(
@@ -1127,142 +1204,31 @@ fn test_impact_from_ids<'a>(
         .collect()
 }
 
-fn print_all_with_tests(
+fn report_all_with_tests(
     graph: &EntityGraph,
     entity: &EntityInfo,
     tests: &[&EntityInfo],
-    json: bool,
     depth: usize,
-) {
-    let deps = graph.get_dependencies(&entity.id);
-    let dependents = graph.get_dependents(&entity.id);
-    let impact_bounded = graph.impact_analysis_bounded(&entity.id, depth);
-
-    if json {
-        let impact_entities: Vec<serde_json::Value> = impact_bounded
-            .iter()
-            .map(|(e, d)| {
-                let mut v = entity_json(e);
-                v.as_object_mut()
-                    .unwrap()
-                    .insert("depth".to_string(), serde_json::json!(d));
-                v
-            })
-            .collect();
-        let output = serde_json::json!({
-            "entity": entity_json(entity),
-            "dependencies": entity_list_json(&deps),
-            "dependents": entity_list_json(&dependents),
-            "impact": {
-                "depth": depth,
-                "total": impact_bounded.len(),
-                "entities": impact_entities,
-            },
-            "tests": entity_list_json(tests),
-        });
-        println!("{}", serde_json::to_string(&output).unwrap());
-    } else {
-        print_entity_header(entity);
-
-        // Dependencies
-        if !deps.is_empty() {
-            println!("\n  {} {}", "→".blue(), "depends on:".dimmed());
-            for dep in &deps {
-                println!(
-                    "    {} {} {} ({})",
-                    "→".blue(),
-                    dep.entity_type.dimmed(),
-                    dep.name.bold(),
-                    dep.file_path.dimmed(),
-                );
-            }
-        }
-
-        // Dependents
-        if !dependents.is_empty() {
-            println!("\n  {} {}", "←".yellow(), "depended on by:".dimmed());
-            for dep in &dependents {
-                println!(
-                    "    {} {} {} ({})",
-                    "←".yellow(),
-                    dep.entity_type.dimmed(),
-                    dep.name.bold(),
-                    dep.file_path.dimmed(),
-                );
-            }
-        }
-
-        // Transitive impact grouped by depth
-        if impact_bounded.is_empty() {
-            println!(
-                "\n  {} {}",
-                "✓".green().bold(),
-                "No other entities are affected by changes to this entity.".dimmed()
-            );
-        } else {
-            let max_depth_seen = impact_bounded.iter().map(|(_, d)| *d).max().unwrap_or(0);
-            let depth_label = if depth == 0 {
-                "unlimited".to_string()
-            } else {
-                format!("depth {}", depth)
-            };
-            println!(
-                "\n  {} {}",
-                "!".red().bold(),
-                format!(
-                    "{} entities transitively affected ({}):",
-                    impact_bounded.len(),
-                    depth_label
-                )
-                .red(),
-            );
-
-            for d in 1..=max_depth_seen {
-                let at_depth: Vec<_> = impact_bounded
-                    .iter()
-                    .filter(|(_, dd)| *dd == d)
-                    .map(|(e, _)| *e)
-                    .collect();
-                if at_depth.is_empty() {
-                    continue;
-                }
-
-                let label = if d == 1 {
-                    "Direct dependents".to_string()
-                } else {
-                    format!("Depth {}", d)
-                };
-                println!("\n    {} ({})", label.bold(), at_depth.len());
-                for imp in &at_depth {
-                    println!(
-                        "      {} {} {} ({}:L{})",
-                        "→".red(),
-                        imp.entity_type.dimmed(),
-                        imp.name.bold(),
-                        imp.file_path.dimmed(),
-                        imp.start_line,
-                    );
-                }
-            }
-        }
-
-        // Tests
-        if !tests.is_empty() {
-            println!(
-                "\n  {} {}",
-                "⚡".yellow(),
-                format!("{} tests affected:", tests.len()).bold()
-            );
-            for t in tests {
-                println!(
-                    "    {} {} ({})",
-                    t.entity_type.dimmed(),
-                    t.name.bold(),
-                    t.file_path.dimmed(),
-                );
-            }
-        }
-
-        println!();
-    }
+) -> ImpactReport {
+    let mut report = ImpactReport::for_entity(entity.clone());
+    report.dependencies = graph
+        .get_dependencies(&entity.id)
+        .into_iter()
+        .cloned()
+        .collect();
+    report.dependents = graph
+        .get_dependents(&entity.id)
+        .into_iter()
+        .cloned()
+        .collect();
+    report.impact = graph
+        .impact_analysis_bounded(&entity.id, depth)
+        .into_iter()
+        .map(|(entity, depth)| (EntityInfo::clone(entity), depth))
+        .collect();
+    report.tests = tests
+        .iter()
+        .map(|entity| EntityInfo::clone(*entity))
+        .collect();
+    report
 }

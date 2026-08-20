@@ -4,6 +4,7 @@ pub struct Timings {
     command: &'static str,
     enabled: bool,
     json: bool,
+    source: Option<&'static str>,
     start: Instant,
     last: Instant,
     entries: Vec<TimingEntry>,
@@ -29,6 +30,7 @@ impl Timings {
             command,
             enabled,
             json: value == "json",
+            source: None,
             start: now,
             last: now,
             entries: Vec::new(),
@@ -42,6 +44,7 @@ impl Timings {
             command,
             enabled: false,
             json: false,
+            source: None,
             start: now,
             last: now,
             entries: Vec::new(),
@@ -68,7 +71,17 @@ impl Timings {
         self.counters.push(TimingCounter { name, value });
     }
 
-    pub fn finish(&self) {
+    pub fn source(&mut self, source: &'static str) {
+        if self.enabled {
+            self.source = Some(source);
+        }
+    }
+
+    pub fn is_json(&self) -> bool {
+        self.enabled && self.json
+    }
+
+    pub fn finish(self) {
         if !self.enabled {
             return;
         }
@@ -101,9 +114,15 @@ impl Timings {
                     })
                     .collect::<Vec<_>>());
             }
+            if let Some(source) = self.source {
+                output["source"] = serde_json::json!(source);
+            }
             eprintln!("{}", serde_json::to_string(&output).unwrap());
         } else {
             eprintln!("sem timings ({})", self.command);
+            if let Some(source) = self.source {
+                eprintln!("  {:<32} {:>8}", "source", source);
+            }
             for entry in &self.entries {
                 eprintln!("  {:<32} {:>8.3} ms", entry.name, entry.duration_ms);
             }
