@@ -5,6 +5,7 @@ target/
 node_modules/
 .npm-cache/
 vendor/
+.quiver/
 
 # Scratch / demo files
 *.cast
@@ -32,3 +33,4 @@ result/
 tmp/
 dhat-heap.json
 .claude/worktrees/
+ratatui-debug.log

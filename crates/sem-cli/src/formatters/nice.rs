@@ -39,10 +39,8 @@ pub fn format_nice(result: &DiffResult) -> String {
         ];
 
         for (kind, label) in order {
-            let group: Vec<&&SemanticChange> = changes
-                .iter()
-                .filter(|c| c.change_type == kind)
-                .collect();
+            let group: Vec<&&SemanticChange> =
+                changes.iter().filter(|c| c.change_type == kind).collect();
             if group.is_empty() {
                 continue;
             }
@@ -207,6 +205,8 @@ mod tests {
             renamed_count: 0,
             reordered_count: 0,
             orphan_count: 0,
+            total_entities_before: 0,
+            total_entities_after: 0,
         };
         assert_eq!(format_nice(&result), "No semantic changes detected.\n");
     }
@@ -258,10 +258,7 @@ mod tests {
         // Adding a sibling after `x` causes `x`'s content text to gain a
         // trailing comma — content_hash differs but structural_hash matches,
         // so the differ flags it as a non-structural (cosmetic) change.
-        let result = run_diff(
-            "{\n  \"x\": 1\n}",
-            "{\n  \"x\": 1,\n  \"y\": 2\n}",
-        );
+        let result = run_diff("{\n  \"x\": 1\n}", "{\n  \"x\": 1,\n  \"y\": 2\n}");
         let out = format_nice(&result);
         let x_block_start = out.find("  x\n").expect("x change should be present");
         let x_block = &out[x_block_start..];
