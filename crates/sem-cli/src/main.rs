@@ -2,7 +2,6 @@ mod cache;
 mod commands;
 mod formatters;
 mod hyperlinks;
-mod impact_model;
 mod progress;
 mod stats;
 mod telemetry;
