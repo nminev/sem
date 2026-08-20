@@ -73,13 +73,15 @@ fn resolve_impact(
 ) -> Result<ResolvedImpact, ImpactQueryError> {
     // A resident server beats the cloud path on both freshness and latency,
     // so the sidecar goes first.
-    if let Some(report) = try_sidecar_impact(opts) {
-        timings.mark("sidecar_impact_query");
+    let sidecar_report = try_sidecar_impact(opts);
+    timings.mark("sidecar_probe");
+    if let Some(report) = sidecar_report {
         return Ok(ResolvedImpact::new(report, ImpactSource::Sidecar));
     }
 
-    if let Some(report) = super::cloud::try_cloud_impact(opts) {
-        timings.mark("cloud_impact_query");
+    let cloud_report = super::cloud::try_cloud_impact(opts);
+    timings.mark("cloud_probe");
+    if let Some(report) = cloud_report {
         return Ok(ResolvedImpact::new(report, ImpactSource::Cloud));
     }
 

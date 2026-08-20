@@ -135,7 +135,7 @@ fn stdout_json(output: &Output) -> serde_json::Value {
         .unwrap_or_else(|error| panic!("stdout should be JSON: {error}\n{}", describe(output)))
 }
 
-fn assert_timing_document(output: &Output, expected_source: &str) {
+fn assert_timing_document(output: &Output, expected_source: &str) -> serde_json::Value {
     let timings: serde_json::Value =
         serde_json::from_slice(&output.stderr).unwrap_or_else(|error| {
             panic!(
@@ -152,6 +152,42 @@ fn assert_timing_document(output: &Output, expected_source: &str) {
             .is_some_and(|phases| !phases.is_empty()),
         "{timings}"
     );
+    timings
+}
+
+#[cfg(unix)]
+fn start_stalled_sidecar(repo: &Path, home: &Path) -> JoinHandle<()> {
+    use std::os::unix::net::UnixListener;
+
+    let canonical = repo.canonicalize().unwrap();
+    let hash = canonical
+        .to_string_lossy()
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+    let socket_dir = home.join(".sem").join("sock");
+    fs::create_dir_all(&socket_dir).unwrap();
+    let listener = UnixListener::bind(socket_dir.join(format!("{hash:016x}.sock"))).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match listener.accept() {
+                Ok((_stream, _)) => {
+                    std::thread::sleep(Duration::from_millis(500));
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "fake sidecar request timed out");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("fake sidecar accept failed: {error}"),
+            }
+        }
+    })
 }
 
 fn start_fake_cloud(remote: &str) -> (String, JoinHandle<Vec<String>>) {
@@ -367,6 +403,34 @@ fn a_resident_sidecar_keeps_stderr_empty_when_timings_are_not_requested() {
     assert_success(&output);
     assert_eq!(stdout_json(&output)["entity"]["name"], "consume");
     assert!(output.stderr.is_empty(), "{}", describe(&output));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_sidecar_probe_reports_its_own_latency() {
+    let fixture = ImpactFixture::new();
+    let sidecar = start_stalled_sidecar(fixture.repo.path(), fixture.home.path());
+
+    let output = fixture
+        .command()
+        .env("SEM_TIMINGS", "json")
+        .args(["impact", "consume", "--file", "b.ts", "--deps", "--json"])
+        .output()
+        .unwrap();
+    sidecar.join().unwrap();
+
+    assert_success(&output);
+    assert_eq!(stdout_json(&output)["entity"]["name"], "consume");
+    let timings = assert_timing_document(&output, "local");
+    let phases = timings["phases"].as_array().unwrap();
+    let sidecar_probe = phases
+        .iter()
+        .find(|phase| phase["name"] == "sidecar_probe")
+        .unwrap_or_else(|| panic!("sidecar probe should have its own phase: {timings}"));
+    assert!(
+        sidecar_probe["durationMs"].as_f64().unwrap() >= 200.0,
+        "the stalled sidecar latency should be attributed to its probe: {timings}"
+    );
 }
 
 #[test]
